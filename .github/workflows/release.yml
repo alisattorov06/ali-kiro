@@ -105,5 +105,5 @@ jobs:
           files: |
             dist/ali-kiro-*
             dist/SHA-256SUMS
-          draft: true
+          draft: false
           generate_release_notes: true
