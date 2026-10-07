@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bun-linux-x64
+            asset: ali-kiro-linux-x64
+          - target: bun-linux-arm64
+            asset: ali-kiro-linux-arm64
+          - target: bun-darwin-x64
+            asset: ali-kiro-macos-x64
+          - target: bun-darwin-arm64
+            asset: ali-kiro-macos-arm64
+          - target: bun-windows-x64
+            asset: ali-kiro-windows-x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      # Bun cross-compiles: the --target below produces the binary for the
+      # requested platform/arch from this linux-x64 runner. Windows targets
+      # get a .exe suffix appended automatically.
+      - name: Compile ${{ matrix.asset }}
+        run: bun build --compile ali-kiro.mjs --define=process.env.ALI_KIRO_VERSION="\"${GITHUB_REF_NAME#v}\"" --target=${{ matrix.target }} --outfile=${{ matrix.asset }}
+
+      - name: Verify artifact
+        run: ls -la ${{ matrix.asset }}*
+
+      # Windows-only: stage a self-contained zip (ali-kiro.exe + assets/) so
+      # Windows users can unzip and run without a separate assets download.
+      - name: Package Windows zip
+        if: matrix.target == 'bun-windows-x64'
+        run: |
+          mkdir -p dist-win
+          cp ${{ matrix.asset }}.exe dist-win/ali-kiro.exe
+          cp -r src/assets dist-win/assets
+          cd dist-win && zip -r ../${{ matrix.asset }}.zip ali-kiro.exe assets
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}*
+
+  assets:
+    name: Package assets tarball
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create assets tarball
+        run: tar czf ali-kiro-assets.tar.gz -C src assets
+
+      - name: Upload assets artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ali-kiro-assets
+          path: ali-kiro-assets.tar.gz
+
+  release:
+    name: Create GitHub Release
+    needs: [build, assets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: ali-kiro-*
+          merge-multiple: true
+
+      - name: Generate SHA-256SUMS
+        run: |
+          cd dist
+          sha256sum ali-kiro-* > SHA-256SUMS
+          cat SHA-256SUMS
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ali-kiro-*
+            dist/SHA-256SUMS
+          draft: true
+          generate_release_notes: true
