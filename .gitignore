@@ -1,0 +1,11 @@
+node_modules/
+*.log
+.DS_Store
+
+# local state / scratch
+.ali-kiro/
+tmp/
+target/
+
+# backup files produced by in-place updates
+*.bak-*
