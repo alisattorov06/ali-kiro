@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest an improvement for oh-my-opencode-slim.
+title: '[Feature]: '
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Description
+      placeholder: 
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Extra context
+      description: Optional examples, alternatives, or related links.
+    validations:
+      required: false

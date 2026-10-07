@@ -1,0 +1,396 @@
+/**
+ * Herdr multiplexer implementation
+ *
+ * Splits panes for sub-agent sessions in Herdr.
+ *
+ * Herdr is an agent-aware terminal multiplexer (workspaces → tabs → panes).
+ * Pane IDs use the format `w<workspace>:p<pane>`. The CLI outputs
+ * newline-delimited JSON; `pane split` returns a `pane_info` result whose
+ * `pane.pane_id` field is the new pane's ID.
+ *
+ * Environment detection: Herdr injects `HERDR_PANE_ID` into every pane it
+ * manages; it is the client's anchor and is required for any pane command.
+ */
+
+import type { MultiplexerLayout } from '../../config/schema';
+import { crossSpawn } from '../../utils/compat';
+import { isRecord } from '../../utils/guards';
+import { log } from '../../utils/logger';
+import {
+  buildViewCommand,
+  findBinary,
+  gracefulClosePane,
+  normalizePathForShell,
+  redactViewerSecretArgs,
+} from '../shared';
+import type { Multiplexer, PaneResult, PaneSpawnOptions } from '../types';
+
+type HerdrPaneDirection = 'right' | 'down';
+
+interface HerdrCliResponse {
+  result?: {
+    type?: string;
+    pane?: { pane_id?: string };
+  };
+  error?: { code?: string; message?: string };
+}
+
+export class HerdrMultiplexer implements Multiplexer {
+  readonly type = 'herdr' as const;
+
+  private binaryPath: string | null = null;
+  private hasChecked = false;
+  private layout: MultiplexerLayout;
+  private paneDirection: HerdrPaneDirection;
+  private agentAreaPaneId: string | null = null;
+  // ponytail: serialize spawnPane to prevent concurrent races on agentAreaPaneId
+  private spawnMutex: Promise<unknown> = Promise.resolve();
+
+  constructor(layout: MultiplexerLayout = 'main-vertical', mainPaneSize = 60) {
+    // Herdr does not support exact main pane sizing like tmux.
+    // Layout config is mapped to pane split direction.
+    void mainPaneSize;
+    this.layout = layout;
+    this.paneDirection = getPaneDirection(layout);
+  }
+
+  async isAvailable(): Promise<boolean> {
+    if (this.hasChecked) {
+      return this.binaryPath !== null;
+    }
+
+    const configuredBinaryPath = process.env.HERDR_BIN_PATH;
+    this.binaryPath =
+      configuredBinaryPath && configuredBinaryPath.length > 0
+        ? configuredBinaryPath
+        : await findBinary('herdr');
+    this.hasChecked = true;
+    return this.binaryPath !== null;
+  }
+
+  isInsideSession(): boolean {
+    return !!process.env.HERDR_PANE_ID;
+  }
+
+  async spawnPane(
+    sessionId: string,
+    description: string,
+    serverUrl: string,
+    directory: string,
+    options?: PaneSpawnOptions,
+  ): Promise<PaneResult> {
+    // ponytail: serialize concurrent spawns to prevent races on agentAreaPaneId
+    const prev = this.spawnMutex;
+    let release!: () => void;
+    this.spawnMutex = new Promise<void>((r) => (release = r));
+    await prev;
+
+    try {
+      return await this.doSpawn(
+        sessionId,
+        description,
+        serverUrl,
+        directory,
+        options,
+      );
+    } finally {
+      release();
+    }
+  }
+
+  private async doSpawn(
+    sessionId: string,
+    description: string,
+    serverUrl: string,
+    directory: string,
+    options?: PaneSpawnOptions,
+  ): Promise<PaneResult> {
+    // The parent pane is required: without HERDR_PANE_ID the anchor is
+    // unknowable, so no herdr command may be issued (no `--current` fallback).
+    const parentPaneId = process.env.HERDR_PANE_ID?.trim();
+    if (!parentPaneId) {
+      log('[herdr] spawnPane: HERDR_PANE_ID is not set; cannot resolve target');
+      return { success: false, error: 'not_found' };
+    }
+
+    const herdr = await this.getBinary();
+    if (!herdr) {
+      log('[herdr] spawnPane: herdr binary not found');
+      return { success: false, error: 'unavailable' };
+    }
+
+    try {
+      // Normalize Windows backslashes→/ so sh -lc (MSYS2) doesn't
+      // corrupt --cwd (issue #568).
+      const attachDir = normalizePathForShell(directory);
+
+      // v2 remote hosts: the viewer must authenticate with
+      // OPENCODE_PASSWORD. Inject it at split time through herdr's native
+      // `--env` mechanism so it never reaches the `pane run` command text
+      // (which herdr types into the pane's shell).
+      const viewerSecretArgs =
+        options?.viewerFlavor === 'v2-remote' &&
+        options.viewerPassword !== undefined
+          ? ['--env', `OPENCODE_PASSWORD=${options.viewerPassword}`]
+          : [];
+
+      let paneId: string | null = null;
+      let lastRawOutput = '';
+
+      if (this.layout === 'main-vertical' && this.agentAreaPaneId) {
+        const result = await this.runSplit(
+          this.agentAreaPaneId,
+          'down',
+          attachDir,
+          viewerSecretArgs,
+        );
+        paneId = result.paneId;
+        if (!paneId) {
+          log('[herdr] agent area split failed, falling back to parent', {
+            agentAreaPaneId: this.agentAreaPaneId,
+          });
+          this.agentAreaPaneId = null;
+        }
+      }
+
+      if (!this.agentAreaPaneId) {
+        const result = await this.runSplit(
+          parentPaneId,
+          this.paneDirection,
+          attachDir,
+          viewerSecretArgs,
+        );
+        paneId = result.paneId;
+        lastRawOutput = result.rawOutput;
+      }
+
+      if (!paneId) {
+        log('[herdr] spawnPane: could not parse pane_id from output', {
+          stdout: lastRawOutput,
+        });
+        return { success: false, error: 'hard' };
+      }
+
+      // 2. Rename the pane for visibility. `pane rename` writes the `label`
+      // field (evidence 1.4); the description is the FR-8 metadata and must
+      // survive intact, so it is never truncated.
+      await crossSpawn([herdr, 'pane', 'rename', paneId, description], {
+        stdout: 'ignore',
+        stderr: 'ignore',
+      }).exited;
+
+      // 3. Run opencode attach in the new pane
+      const opencodeCmd = buildViewCommand(
+        sessionId,
+        serverUrl,
+        attachDir,
+        options,
+      );
+
+      const runProc = crossSpawn([herdr, 'pane', 'run', paneId, opencodeCmd], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+
+      const runExitCode = await runProc.exited;
+      if (runExitCode !== 0) {
+        const runStderr = await runProc.stderr();
+        log('[herdr] spawnPane: run failed', {
+          exitCode: runExitCode,
+          stderr: runStderr.trim(),
+        });
+        // ponytail: split succeeded but attach failed; close the orphaned pane
+        // so it does not linger in the agent column. Session manager gets no
+        // paneId on failure, so we must clean it up here.
+        try {
+          await this.closePane(paneId);
+        } catch (closeErr) {
+          log('[herdr] spawnPane: failed to close orphaned pane', {
+            paneId,
+            error: String(closeErr),
+          });
+        }
+        return { success: false, error: 'hard' };
+      }
+
+      // 4. Track agent area pane ID only after successful attach
+      if (this.layout === 'main-vertical' && !this.agentAreaPaneId) {
+        this.agentAreaPaneId = paneId;
+      }
+
+      log('[herdr] spawnPane: SUCCESS', { paneId });
+      return { success: true, paneId };
+    } catch (err) {
+      log('[herdr] spawnPane: exception', { error: String(err) });
+      return { success: false, error: 'hard' };
+    }
+  }
+
+  /**
+   * FR-8 sweep capability: every pane herdr knows about, with its `label`
+   * (the field `pane rename` writes). Titles that are not plugin metadata are
+   * ignored by the sweep.
+   */
+  async listPanesWithTitles(): Promise<
+    Array<{ paneId: string; title: string }>
+  > {
+    const herdr = await this.getBinary();
+    if (!herdr) return [];
+
+    try {
+      const proc = crossSpawn([herdr, 'pane', 'list'], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout] = await Promise.all([
+        proc.exited,
+        proc.stdout(),
+      ]);
+      if (exitCode !== 0) return [];
+
+      const panes: Array<{ paneId: string; title: string }> = [];
+      for (const line of stdout.split('\n')) {
+        const candidate = line.trim();
+        if (!candidate) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(candidate);
+        } catch {
+          continue; // progress/diagnostic line
+        }
+        const result = isRecord(parsed) ? parsed.result : undefined;
+        const entries =
+          isRecord(result) && Array.isArray(result.panes) ? result.panes : [];
+        for (const entry of entries) {
+          if (!isRecord(entry)) continue;
+          const paneId = entry.pane_id;
+          if (typeof paneId !== 'string' || paneId.length === 0) continue;
+          panes.push({
+            paneId,
+            title: typeof entry.label === 'string' ? entry.label : '',
+          });
+        }
+      }
+      return panes;
+    } catch {
+      return [];
+    }
+  }
+
+  async closePane(paneId: string): Promise<boolean> {
+    const herdr = await this.getBinary();
+    const closed = await gracefulClosePane(herdr, paneId, {
+      ctrlC: ['pane', 'send-keys', paneId, 'ctrl+c'],
+      close: ['pane', 'close', paneId],
+      acceptExitCode1: true,
+      emptyPaneReturnsTrue: true,
+    });
+    if (closed && paneId === this.agentAreaPaneId) {
+      this.agentAreaPaneId = null;
+    }
+    return closed;
+  }
+
+  async applyLayout(
+    layout: MultiplexerLayout,
+    _mainPaneSize: number,
+  ): Promise<void> {
+    // ponytail: herdr has no rebalancing API; a layout *switch* starts fresh
+    // from the parent pane, but re-applying the same layout must keep the
+    // agent-column anchor so later children stack below the first one.
+    if (this.layout !== layout) {
+      this.agentAreaPaneId = null;
+    }
+    this.layout = layout;
+    this.paneDirection = getPaneDirection(layout);
+  }
+
+  private async runSplit(
+    target: string,
+    direction: HerdrPaneDirection,
+    directory: string,
+    viewerSecretArgs: string[] = [],
+  ): Promise<{ paneId: string | null; rawOutput: string }> {
+    const herdr = await this.getBinary();
+    if (!herdr) return { paneId: null, rawOutput: '' };
+
+    const splitArgs = [
+      herdr,
+      'pane',
+      'split',
+      target,
+      '--direction',
+      direction,
+      '--cwd',
+      directory,
+      '--no-focus',
+      ...viewerSecretArgs,
+    ];
+
+    log('[herdr] spawnPane: splitting pane', {
+      args: redactViewerSecretArgs(splitArgs),
+    });
+
+    const splitProc = crossSpawn(splitArgs, {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+
+    const splitExitCode = await splitProc.exited;
+    const splitStdout = await splitProc.stdout();
+    const splitStderr = await splitProc.stderr();
+
+    if (splitExitCode !== 0) {
+      log('[herdr] spawnPane: split failed', {
+        exitCode: splitExitCode,
+        stderr: splitStderr.trim(),
+      });
+      return { paneId: null, rawOutput: splitStdout.trim() };
+    }
+
+    return { paneId: parsePaneId(splitStdout), rawOutput: splitStdout.trim() };
+  }
+
+  private async getBinary(): Promise<string | null> {
+    await this.isAvailable();
+    return this.binaryPath;
+  }
+}
+
+/**
+ * Parse the pane_id from a herdr CLI JSON response.
+ *
+ * Herdr outputs newline-delimited JSON like:
+ * {"id":"cli:pane:split","result":{"type":"pane_info","pane":{"pane_id":"w1:p2",...}}}
+ */
+function parsePaneId(stdout: string): string | null {
+  const trimmed = stdout.trim();
+  if (!trimmed) return null;
+
+  for (const line of trimmed.split('\n')) {
+    const candidate = line.trim();
+    if (!candidate) continue;
+    try {
+      const response = JSON.parse(candidate) as HerdrCliResponse;
+      const paneId = response.result?.pane?.pane_id;
+      if (paneId) return paneId;
+    } catch {
+      // Not a JSON line (e.g. progress/diagnostic); skip and keep scanning.
+    }
+  }
+
+  log('[herdr] parsePaneId: no pane_id found in output', { stdout: trimmed });
+  return null;
+}
+
+function getPaneDirection(layout: MultiplexerLayout): HerdrPaneDirection {
+  switch (layout) {
+    case 'main-horizontal':
+    case 'even-vertical':
+      return 'down';
+    case 'main-vertical':
+    case 'even-horizontal':
+    case 'tiled':
+      return 'right';
+  }
+}

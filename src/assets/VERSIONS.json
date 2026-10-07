@@ -1,0 +1,74 @@
+{
+  "format": 1,
+  "plugins": {
+    "FlowDeck": {
+      "version": "0.7.0",
+      "hasBunLock": false,
+      "hasPackageLock": true
+    },
+    "harness-memory": {
+      "version": "0.5.1",
+      "hasBunLock": false,
+      "hasPackageLock": true
+    },
+    "oh-my-opencode-slim": {
+      "version": "3.0.3",
+      "hasBunLock": true,
+      "hasPackageLock": true
+    },
+    "opencode-dynamic-context-pruning": {
+      "version": "3.2.0",
+      "hasBunLock": false,
+      "hasPackageLock": true
+    },
+    "opencode-snip": {
+      "version": "git-main",
+      "hasBunLock": false,
+      "hasPackageLock": true
+    }
+  },
+  "skillsCount": 38,
+  "mcps": {
+    "context7": {
+      "type": "remote",
+      "auto": true
+    },
+    "gh_grep": {
+      "type": "remote",
+      "auto": true
+    },
+    "grep_app": {
+      "type": "remote",
+      "auto": false
+    },
+    "websearch": {
+      "type": "remote",
+      "auto": true
+    },
+    "github": {
+      "type": "remote",
+      "auto": false
+    },
+    "memory": {
+      "type": "local",
+      "auto": true
+    },
+    "sequentialThinking": {
+      "type": "local",
+      "auto": true
+    },
+    "playwright": {
+      "type": "local",
+      "auto": true
+    },
+    "tokenOptimizer": {
+      "type": "local",
+      "auto": false
+    },
+    "magic": {
+      "type": "local",
+      "auto": false
+    }
+  },
+  "bundledAt": "2026-10-07T13:38:47Z"
+}

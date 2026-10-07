@@ -1,0 +1,84 @@
+{
+  "_comment": "OpenCode MCP server presets. The opencode CLI only shows name+status, not configuration details, so this file was rebuilt from the npx cache and known sources (auto:true = verified working, installed automatically; auto:false = manual, needs attention). Edit freely to suit your setup.",
+  "generated": "2026-10-07",
+  "source_machine": "linux-x64, opencode v2.0.24",
+  "servers": [
+    {
+      "name": "context7",
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "status_was": "connected (2 tools)",
+      "auto": true
+    },
+    {
+      "name": "gh_grep",
+      "type": "remote",
+      "url": "https://mcp.grep.app/mcp",
+      "status_was": "connected (1 tool)",
+      "auto": true,
+      "note": "GitHub code search (grep.app MCP)"
+    },
+    {
+      "name": "grep_app",
+      "type": "remote",
+      "url": "https://mcp.grep.app/mcp",
+      "status_was": "connected (1 tool)",
+      "auto": false,
+      "note": "Likely duplicate of gh_grep (same URL) — check manually and remove if duplicated"
+    },
+    {
+      "name": "websearch",
+      "type": "remote",
+      "url": "https://mcp.exa.ai/mcp",
+      "status_was": "connected (1 tool)",
+      "auto": true,
+      "note": "Add --env EXA_API_KEY=... if an API key is required"
+    },
+    {
+      "name": "github",
+      "type": "remote",
+      "url": "https://api.githubcopilot.com/mcp",
+      "status_was": "failed (401 missing Authorization header)",
+      "auto": false,
+      "install_hint": "opencode mcp add github --url https://api.githubcopilot.com/mcp --header 'Authorization=token <GITHUB_TOKEN>' --global",
+      "note": "401 — token required; add yours manually"
+    },
+    {
+      "name": "memory",
+      "type": "local",
+      "command": ["npx", "-y", "mcp-server-memory"],
+      "status_was": "connected (9 tools)",
+      "auto": true
+    },
+    {
+      "name": "sequentialThinking",
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "status_was": "connected (1 tool)",
+      "auto": true
+    },
+    {
+      "name": "playwright",
+      "type": "local",
+      "command": ["npx", "-y", "@playwright/mcp@latest"],
+      "status_was": "connected (25 tools)",
+      "auto": true
+    },
+    {
+      "name": "tokenOptimizer",
+      "type": "local",
+      "command": ["npx", "-y", "token-optimizer-mcp"],
+      "status_was": "failed (better-sqlite3 native addon topilmadi: ~/.npm/_npx/ccff4472a4fb6e22/node_modules/token-optimizer-mcp)",
+      "auto": false,
+      "note": "native better-sqlite3 build issue; clearing the npx cache and reinstalling usually fixes it; cache: ~/.token-optimizer-cache/cache.db"
+    },
+    {
+      "name": "magic",
+      "type": "local",
+      "command": ["npx", "-y", "magic-mcp"],
+      "status_was": "connected (3 tools)",
+      "auto": false,
+      "note": "npm package name is approximate (magic-mcp) — verify manually"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+[package]
+name = "oh-my-opencode-slim-companion"
+version = "0.1.4"
+edition = "2021"
+description = "Desktop companion for oh-my-opencode-slim - shows active agent GIFs per session"
+
+[[bin]]
+name = "oh-my-opencode-slim-companion"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.29", default-features = true }
+egui = "0.29"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+winit = "0.30"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

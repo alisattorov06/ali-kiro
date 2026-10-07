@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    "./plugins/opencode-snip",
+    "./plugins/harness-memory",
+    "./plugins/opencode-dynamic-context-pruning",
+    "./plugins/oh-my-opencode-slim",
+    "./plugins/FlowDeck"
+  ]
+}

@@ -1,0 +1,339 @@
+import * as fs from 'node:fs';
+import { z } from 'zod';
+import {
+  findPluginConfigPaths,
+  mergePluginConfigs,
+  normalizeDisabledArrayKeys,
+} from '../config/loader';
+import {
+  MultiplexerConfigStrictSchema,
+  type PluginConfig,
+  PluginConfigSchema,
+} from '../config/schema';
+import { stripJsonComments } from './config-io';
+
+export type DoctorArgs = {
+  json?: boolean;
+  error?: string;
+  help?: boolean;
+};
+
+export function parseDoctorArgs(args: string[]): DoctorArgs {
+  const result: DoctorArgs = {};
+
+  for (const arg of args) {
+    if (arg === '--json') {
+      result.json = true;
+    } else if (arg === '--help' || arg === '-h') {
+      result.help = true;
+    } else {
+      result.error ??= `Unknown doctor option: ${arg}`;
+    }
+  }
+
+  return result;
+}
+
+export type ConfigCheckResult = {
+  scope: 'user' | 'project';
+  path: string | null;
+  exists: boolean;
+  ok: boolean;
+  config?: PluginConfig;
+  error?: {
+    kind: 'invalid-json' | 'invalid-schema' | 'read-error';
+    message: string;
+    issues?: z.ZodIssue[];
+  };
+};
+
+export type PresetCheckResult = {
+  preset: string;
+  ok: boolean;
+  error?: { kind: 'missing-preset'; message: string };
+};
+
+export type DoctorResult = {
+  ok: boolean;
+  project: string;
+  configs: ConfigCheckResult[];
+  presetCheck?: PresetCheckResult;
+};
+
+/**
+ * Diagnostic-only re-validation of the raw `multiplexer` block.
+ *
+ * Runtime parsing runs `sanitizeMultiplexerConfig` before zod validation, so
+ * invalid `multiplexer.*` values are rewritten to `type: "none"` and never
+ * surface in the main parse. Doctor is a diagnostic surface: validate the raw
+ * object with the unsanitized schema and merge those issues (path-prefixed
+ * with `multiplexer.`) so the user still sees the mistake.
+ */
+function collectMultiplexerIssues(rawConfig: unknown): z.ZodIssue[] {
+  if (
+    typeof rawConfig !== 'object' ||
+    rawConfig === null ||
+    Array.isArray(rawConfig)
+  ) {
+    return [];
+  }
+
+  const multiplexer = (rawConfig as Record<string, unknown>).multiplexer;
+  // Any present block is re-validated, including non-object values: the
+  // runtime sanitizer disables pane management for those (`type: "none"`), so
+  // doctor must surface the shape instead of reporting a healthy config.
+  // Absence stays out of scope for these `multiplexer.*` path diagnostics.
+  if (multiplexer === undefined) return [];
+
+  const result = MultiplexerConfigStrictSchema.safeParse(multiplexer);
+  if (result.success) {
+    return [];
+  }
+
+  return result.error.issues.map((issue) => ({
+    ...issue,
+    path: ['multiplexer', ...issue.path],
+  }));
+}
+
+function checkConfigFile(
+  scope: 'user' | 'project',
+  configPath: string | null,
+): ConfigCheckResult {
+  if (configPath === null) {
+    return { scope, path: null, exists: false, ok: true };
+  }
+
+  try {
+    const stat = fs.statSync(configPath);
+
+    if (stat.size === 0) {
+      return {
+        scope,
+        path: configPath,
+        exists: true,
+        ok: false,
+        error: {
+          kind: 'invalid-json',
+          message: 'Empty file is not valid JSON',
+        },
+      };
+    }
+
+    // Strip a UTF-8 BOM so a BOM-prefixed config is not misdiagnosed as
+    // invalid JSON (matches the loader's behavior).
+    const content = fs.readFileSync(configPath, 'utf-8').replace(/^\uFEFF/, '');
+    const rawConfig = JSON.parse(stripJsonComments(content));
+    // Normalize disabled_* keys exactly like the loader does before schema
+    // validation, so a string value (e.g. "explorer") is not diagnosed as a
+    // false invalid-schema error. Report each normalization to the user.
+    normalizeDisabledArrayKeys(rawConfig, (message) => {
+      console.warn(`[oh-my-opencode-slim] ${message}`);
+    });
+    const parseResult = PluginConfigSchema.safeParse(rawConfig);
+    // The runtime schema sanitizes invalid multiplexer values into
+    // `type: "none"`, hiding them from the main parse. Merge what the
+    // unsanitized schema finds so doctor still reports invalid-schema. The
+    // sanitizer guarantees the main parse never reports these itself, so no
+    // issue can appear twice.
+    const multiplexerIssues = collectMultiplexerIssues(rawConfig);
+
+    if (!parseResult.success || multiplexerIssues.length > 0) {
+      const error = new z.ZodError([
+        ...(parseResult.success ? [] : parseResult.error.issues),
+        ...multiplexerIssues,
+      ]);
+      return {
+        scope,
+        path: configPath,
+        exists: true,
+        ok: false,
+        error: {
+          kind: 'invalid-schema',
+          message: z.prettifyError(error),
+          issues: error.issues,
+        },
+      };
+    }
+
+    return {
+      scope,
+      path: configPath,
+      exists: true,
+      ok: true,
+      config: parseResult.data,
+    };
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      return {
+        scope,
+        path: configPath,
+        exists: true,
+        ok: false,
+        error: {
+          kind: 'invalid-json',
+          message: err.message,
+        },
+      };
+    } else if (
+      err instanceof Error &&
+      'code' in err &&
+      (err as NodeJS.ErrnoException).code === 'ENOENT'
+    ) {
+      return {
+        scope,
+        path: configPath,
+        exists: false,
+        ok: false,
+        error: {
+          kind: 'read-error',
+          message: 'File was not found while reading',
+        },
+      };
+    }
+
+    return {
+      scope,
+      path: configPath,
+      exists: true,
+      ok: false,
+      error: {
+        kind: 'read-error',
+        message: err instanceof Error ? err.message : String(err),
+      },
+    };
+  }
+}
+
+function checkPreset(
+  mergedConfig: PluginConfig,
+): PresetCheckResult | undefined {
+  const envPreset = process.env.OH_MY_OPENCODE_SLIM_PRESET;
+  const presetName = envPreset || mergedConfig.preset;
+
+  if (presetName === undefined) {
+    return undefined;
+  }
+
+  if (!mergedConfig.presets?.[presetName]) {
+    return {
+      preset: presetName,
+      ok: false,
+      error: {
+        kind: 'missing-preset',
+        message: `Preset "${presetName}" not found in config`,
+      },
+    };
+  }
+
+  return { preset: presetName, ok: true };
+}
+
+export function runDoctorCheck(cwd: string): DoctorResult {
+  const { userConfigPath, projectConfigPaths } = findPluginConfigPaths(cwd);
+
+  const userCheck = checkConfigFile('user', userConfigPath);
+  const projectChecks = (
+    projectConfigPaths.length > 0 ? projectConfigPaths : [null]
+  ).map((configPath) => checkConfigFile('project', configPath));
+  const configs = [userCheck, ...projectChecks];
+
+  const hasInvalidConfig = configs.some((c) => !c.ok);
+
+  let presetCheckResult: DoctorResult['presetCheck'] | undefined;
+  if (!hasInvalidConfig) {
+    const mergedConfig = configs.reduce<PluginConfig>(
+      (merged, check) =>
+        check.config ? mergePluginConfigs(merged, check.config) : merged,
+      {},
+    );
+    presetCheckResult = checkPreset(mergedConfig);
+  }
+
+  return {
+    ok:
+      configs.every((c) => c.ok) &&
+      (!presetCheckResult || presetCheckResult.ok),
+    project: cwd,
+    configs,
+    presetCheck: presetCheckResult,
+  };
+}
+
+export function formatHumanDoctorResult(result: DoctorResult): string {
+  const lines: string[] = [];
+
+  lines.push(`Project: ${result.project}`);
+  lines.push('');
+
+  for (const config of result.configs) {
+    if (config.path === null) {
+      lines.push(`[${config.scope}] No config file found`);
+    } else {
+      const status = config.ok ? '✓' : '✗';
+      lines.push(`[${config.scope}] ${config.path} ${status}`);
+
+      if (!config.ok && config.error) {
+        if (config.error.kind === 'invalid-json') {
+          lines.push(`  Invalid JSON: ${config.error.message}`);
+        } else if (config.error.kind === 'invalid-schema') {
+          lines.push('  Schema error:');
+          for (const line of config.error.message.split('\n')) {
+            lines.push(`  ${line}`);
+          }
+        } else if (config.error.kind === 'read-error') {
+          lines.push(`  Read error: ${config.error.message}`);
+        }
+      }
+    }
+  }
+
+  if (result.presetCheck) {
+    lines.push('');
+    const status = result.presetCheck.ok ? '✓' : '✗';
+    lines.push(`[preset] ${result.presetCheck.preset} ${status}`);
+
+    if (result.presetCheck.error) {
+      lines.push(`  ${result.presetCheck.error.message}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+export function formatJsonDoctorResult(result: DoctorResult): string {
+  return JSON.stringify(
+    {
+      ...result,
+      configs: result.configs.map(({ config: _config, ...config }) => config),
+    },
+    null,
+    2,
+  );
+}
+
+export async function doctor(args: DoctorArgs): Promise<number> {
+  if (args.help) {
+    console.log(`Usage: oh-my-opencode-slim doctor [OPTIONS]
+
+Options:
+  --json              Print diagnostics as JSON
+  -h, --help          Show this help message`);
+    return 0;
+  }
+
+  if (args.error) {
+    console.error(args.error);
+    return 1;
+  }
+
+  const result = runDoctorCheck(process.cwd());
+
+  if (args.json) {
+    console.log(formatJsonDoctorResult(result));
+  } else {
+    console.log(formatHumanDoctorResult(result));
+  }
+
+  return result.ok ? 0 : 1;
+}

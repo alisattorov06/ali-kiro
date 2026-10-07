@@ -1,0 +1,993 @@
+import { join, dirname, resolve, basename, sep } from "path"
+import { homedir } from "os"
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, rmSync } from "fs"
+
+const STATE_FILE = "STATE.md"
+const PLAN_FILE = "plan.md"
+const TASK_FILE = "task.md"
+const AFFECT_FILE = "affect.md"
+const ARCHITECTURE_FILE = "architecture.md"
+const RESULT_FILE = "RESULT.md"
+const CHECKPOINT_FILE = "checkpoint.json"
+export const CONTEXT_FILE = "context.md"
+export const DECISIONS_FILE = "decisions.md"
+
+/** Directory names directly under the planning root that are not topics. */
+const RESERVED_PLANNING_ENTRIES = new Set(["phases", "logs", "cache"])
+
+export { codebaseDir } from "./codebase-state"
+
+/**
+ * Global planning root for a project.
+ *
+ * Planning artifacts live outside the repo at `~/.fd-plan/<project-slug>/` so
+ * they never pollute the working tree. The slug is the project directory name.
+ */
+export function planningDir(directory: string): string {
+  return join(homedir(), ".fd-plan", basename(directory))
+}
+
+export function statePath(directory: string): string {
+  return join(planningDir(directory), STATE_FILE)
+}
+
+/** Machine-readable session checkpoint, written by /fd-checkpoint and the idle hook. */
+export function checkpointPath(directory: string): string {
+  return join(planningDir(directory), CHECKPOINT_FILE)
+}
+
+/** Project-level tech design, written once by /fd-task's init step. */
+export function projectArchitecturePath(directory: string): string {
+  return join(planningDir(directory), ARCHITECTURE_FILE)
+}
+
+/**
+ * Normalize a free-form topic name into a directory-safe slug.
+ *
+ * Returns an empty string when nothing usable remains, so callers can treat
+ * that as "no topic" rather than writing to the planning root by accident.
+ */
+export function slugifyTopic(topic: string): string {
+  return topic
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64)
+}
+
+/** Directory holding one topic's artifacts: `~/.fd-plan/<slug>/<topic>/`. */
+export function topicDir(directory: string, topic: string): string {
+  return join(planningDir(directory), slugifyTopic(topic))
+}
+
+export function topicTaskPath(directory: string, topic: string): string {
+  return join(topicDir(directory, topic), TASK_FILE)
+}
+
+export function topicPlanPath(directory: string, topic: string): string {
+  return join(topicDir(directory, topic), PLAN_FILE)
+}
+
+export function topicAffectPath(directory: string, topic: string): string {
+  return join(topicDir(directory, topic), AFFECT_FILE)
+}
+
+export function topicArchitecturePath(directory: string, topic: string): string {
+  return join(topicDir(directory, topic), ARCHITECTURE_FILE)
+}
+
+export function resultPath(directory: string, topic: string): string {
+  return join(topicDir(directory, topic), RESULT_FILE)
+}
+
+/** Per-topic agent-output log: `~/.fd-plan/<slug>/<topic>/context.md`. */
+export function topicContextPath(directory: string, topic: string): string {
+  return join(topicDir(directory, topic), CONTEXT_FILE)
+}
+
+/** Per-topic design-decision log: `~/.fd-plan/<slug>/<topic>/decisions.md`. */
+export function topicDecisionsPath(directory: string, topic: string): string {
+  return join(topicDir(directory, topic), DECISIONS_FILE)
+}
+
+/**
+ * Read a file as UTF-8 string, or return `{ exists: false }` when missing.
+ *
+ * Used by fdx-context and fdx-decisions to give callers a uniform shape
+ * regardless of whether the file has been written yet. Does NOT create
+ * the file or any parent directories.
+ */
+export function readOrMissing(path: string): { exists: true; content: string } | { exists: false } {
+  if (!existsSync(path)) return { exists: false }
+  return { exists: true, content: readFileSync(path, "utf-8") }
+}
+
+/**
+ * Append a single line to a file, creating the file and any missing
+ * parent directories. Does NOT add a trailing newline — callers compose
+ * the line including its own terminator (most callers append "\n").
+ *
+ * Atomicity: a single `writeFileSync` with the existing content
+ * concatenated. Concurrent appenders may interleave; callers that need
+ * serial writes should hold a mutex at the application layer.
+ */
+export function appendWithMkdir(path: string, line: string): void {
+  const dir = dirname(path)
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  const existing = existsSync(path) ? readFileSync(path, "utf-8") : ""
+  writeFileSync(path, existing + line, "utf-8")
+}
+
+/** Truncate a file to empty string. Idempotent; safe on missing file. */
+export function clearFile(path: string): void {
+  if (existsSync(path)) writeFileSync(path, "", "utf-8")
+}
+
+/** Maximum age (ms) for a held lock before we treat it as stale and steal it. */
+const LOCK_STALE_MS = 5_000
+
+/** Polling interval (ms) when waiting for a held lock. */
+const LOCK_POLL_MS = 50
+
+/** Total time (ms) we will wait to acquire a lock before falling through. */
+const LOCK_ACQUIRE_TIMEOUT_MS = 1_000
+
+/**
+ * Atomically check if a lock is held, and if so, whether the holder PID is
+ * still alive and the lock age is under `LOCK_STALE_MS`. Returns `true` when
+ * the lock should be considered free (stolen or absent), `false` when held.
+ */
+function tryClaimLock(lockPath: string): boolean {
+  if (!existsSync(lockPath)) {
+    // No lock present — try to claim it.
+    try {
+      writeFileSync(lockPath, `${process.pid}:${Date.now()}`, { flag: "wx" })
+      return true
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err
+      return false
+    }
+  }
+
+  // Lock is present. Check staleness.
+  try {
+    const stat = statSync(lockPath)
+    if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+      // Stale lock from a crashed process — steal it.
+      try {
+        rmSync(lockPath)
+      } catch {
+        // Another process may have stolen it first; fall through to the
+        // EEXIST path below.
+      }
+      try {
+        writeFileSync(lockPath, `${process.pid}:${Date.now()}`, { flag: "wx" })
+        return true
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err
+        return false
+      }
+    }
+    return false
+  } catch {
+    // Could not stat the lock (race with cleanup); treat as held.
+    return false
+  }
+}
+
+/**
+ * Append a single line to a file under a per-topic advisory lock.
+ *
+ * Acquire pattern: write `path + ".lock"` with `wx` (atomic create-or-fail).
+ * On contention, poll every `LOCK_POLL_MS` up to `LOCK_ACQUIRE_TIMEOUT_MS`
+ * total. On 1-second timeout, fall through to an unlocked append and log
+ * the contention — the alternative is silent data loss.
+ *
+ * Stale-lock detection: if the existing lock is older than `LOCK_STALE_MS`,
+ * it's stolen. This prevents a single crashed append from blocking all
+ * subsequent appends forever.
+ *
+ * Single-host advisory lock; does not work across machines. Used by
+ * `fdx-context append` and `fdx-decisions record` to prevent concurrent
+ * subagents from interleaving lines.
+ */
+export function appendWithLock(path: string, line: string): void {
+  const lockPath = path + ".lock"
+  const dir = dirname(path)
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+
+  const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS
+  let acquired = false
+  while (Date.now() < deadline) {
+    if (tryClaimLock(lockPath)) {
+      acquired = true
+      break
+    }
+    // Busy-wait via Date.now() loop is intentional here — the timeout is
+    // short (1s total, 50ms per attempt), and we cannot yield to the event
+    // loop from a sync function. Caller is expected to be in an async context;
+    // we accept the 50ms CPU peg as the cost of a sync lock API.
+    const waitUntil = Date.now() + LOCK_POLL_MS
+    while (Date.now() < waitUntil) {
+      /* spin */
+    }
+  }
+
+  if (!acquired) {
+    // Lock contended past our deadline. Log to stderr (visible in plugin logs)
+    // and proceed unlocked — the alternative is silent data loss.
+    process.stderr.write(
+      `[appendWithLock] lock contention timeout for ${path} after ${LOCK_ACQUIRE_TIMEOUT_MS}ms; appending unlocked\n`,
+    )
+    appendWithMkdir(path, line)
+    return
+  }
+
+  try {
+    appendWithMkdir(path, line)
+  } finally {
+    try {
+      rmSync(lockPath)
+    } catch {
+      // Lock already gone or unreadable; nothing to do.
+    }
+  }
+}
+
+/**
+ * Truncate a file to empty string under the same per-topic advisory lock
+ * used by `appendWithLock`. Used by `fdx-context.clear` to prevent racing
+ * with a concurrent append.
+ */
+export function clearFileWithLock(path: string): void {
+  const lockPath = path + ".lock"
+  const dir = dirname(path)
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+
+  const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS
+  let acquired = false
+  while (Date.now() < deadline) {
+    if (tryClaimLock(lockPath)) {
+      acquired = true
+      break
+    }
+    const waitUntil = Date.now() + LOCK_POLL_MS
+    while (Date.now() < waitUntil) {
+      /* spin */
+    }
+  }
+
+  if (!acquired) {
+    process.stderr.write(
+      `[clearFileWithLock] lock contention timeout for ${path} after ${LOCK_ACQUIRE_TIMEOUT_MS}ms; clearing unlocked\n`,
+    )
+    clearFile(path)
+    return
+  }
+
+  try {
+    clearFile(path)
+  } finally {
+    try {
+      rmSync(lockPath)
+    } catch {
+      // Lock already gone.
+    }
+  }
+}
+
+/**
+ * Resolve the active topic slug for the project.
+ *
+ * Prefers `state.topic` from STATE.md. When absent (or pointing at a topic
+ * that was never created), falls back to the most recently modified topic
+ * directory that actually holds artifacts. Returns `null` when none exists.
+ */
+export function resolveActiveTopic(
+  directory: string,
+  state?: Pick<PlanningState, "topic">,
+): string | null {
+  const declared = state?.topic?.trim()
+  if (declared) {
+    const slug = slugifyTopic(declared)
+    if (slug && existsSync(join(planningDir(directory), slug))) return slug
+  }
+
+  const root = planningDir(directory)
+  if (!existsSync(root)) return null
+
+  let newest: { slug: string; mtimeMs: number } | null = null
+  try {
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue
+      if (RESERVED_PLANNING_ENTRIES.has(entry.name)) continue
+      const dir = join(root, entry.name)
+      const hasArtifact = [PLAN_FILE, TASK_FILE].some(f => existsSync(join(dir, f)))
+      if (!hasArtifact) continue
+      const mtimeMs = statSync(dir).mtimeMs
+      if (!newest || mtimeMs > newest.mtimeMs) newest = { slug: entry.name, mtimeMs }
+    }
+  } catch {
+    return null
+  }
+  return newest?.slug ?? null
+}
+
+export interface ResolvedPlan {
+  /** The absolute path to the resolved plan file */
+  path: string
+  /** Which canonical layer the path came from */
+  source: "explicit_plan_file" | "topic_plan"
+  /** True when STATE.md named this file explicitly */
+  isExplicit: boolean
+}
+
+/**
+ * Resolve the active plan file path for the project.
+ *
+ * Resolution order (canonical):
+ *   1. `state.plan_file` if set and the file exists on disk
+ *   2. `~/.fd-plan/<slug>/<topic>/plan.md` for the active topic
+ *
+ * Returns `null` when no plan can be located. Callers should treat that as
+ * "no plan available" rather than guessing a path.
+ */
+export function resolveActivePlanPath(
+  directory: string,
+  state: Pick<PlanningState, "topic" | "plan_file">,
+): ResolvedPlan | null {
+  const explicit = state.plan_file?.trim()
+  if (explicit) {
+    // Honor explicit plan_file path even if it lives outside ~/.fd-plan/.
+    // Falls through to canonical resolution only when the explicit file is missing.
+    if (existsSync(explicit)) {
+      return { path: explicit, source: "explicit_plan_file", isExplicit: true }
+    }
+  }
+
+  const topic = resolveActiveTopic(directory, state)
+  if (topic) {
+    const planPath = topicPlanPath(directory, topic)
+    if (existsSync(planPath)) {
+      return { path: planPath, source: "topic_plan", isExplicit: false }
+    }
+  }
+
+  return null
+}
+
+export interface TDDState {
+  /** Current stage: 'behavior' | 'red' | 'green' | 'refactor' | 'complete' */
+  stage: "behavior" | "red" | "green" | "refactor" | "complete"
+  /** Current cycle number (1-based) */
+  cycle: number
+  /** Behaviors defined for current feature/bug */
+  behaviors: TDDBehavior[]
+  /** Test file paths linked to current session */
+  regression_test_links: string[]
+  /** Override decisions with reasons */
+  override_log: TDDOverride[]
+  /** Failing test count */
+  failing_tests: number
+  /** Passing test count */
+  passing_tests: number
+}
+
+export interface TDDBehavior {
+  id: string
+  description: string
+  status: "pending" | "red" | "green" | "refactor" | "complete"
+  test_file?: string
+}
+
+export interface TDDOverride {
+  timestamp: string
+  stage: string
+  reason: string
+  override_by: string
+}
+
+export interface PlanningState {
+  phase: number
+  /** Slug of the active topic directory under `~/.fd-plan/<slug>/`. */
+  topic?: string
+  status: string
+  plan_confirmed: boolean
+  task_type?: string
+  requires_design_first: boolean
+  design_stage: "pending" | "discovery" | "ux_planning" | "wireframe_layout" | "visual_system_definition" | "design_approval" | "handoff_complete"
+  design_approved: boolean
+  design_override: boolean
+  design_override_reason?: string
+  design_artifact?: string
+  steps_complete: number[]
+  steps_pending: number[]
+  last_action: string
+  next_action: string
+  blockers: string[]
+  /** TDD workflow state (undefined when TDD not active) */
+  tdd: TDDState | undefined
+  /** When this state was last updated */
+  lastUpdatedAt: string
+  /** Which agent last updated the state */
+  lastUpdatedBy: string
+  /** Phase when state was last updated */
+  lastUpdatedPhase: number
+  /** Monotonically increasing version number */
+  summaryVersion: number
+  /** Whether the state is still considered fresh enough to use */
+  freshnessStatus: "fresh" | "stale" | "unknown"
+  /** Adaptive workflow class selected by the router */
+  workflowClass?: string
+  /** Stages intentionally skipped for this task */
+  skippedStages?: string[]
+  /** History of workflow escalations */
+  escalationHistory?: Array<{
+    from: string
+    to: string
+    trigger: string
+    reason: string
+    timestamp: string
+  }>
+  /** Routing decision score breakdown */
+  routingScores?: {
+    simplicity: number
+    confidence: number
+    lowRisk: number
+    knownCodebase: number
+    cheapComplexity: number
+    total: number
+  }
+  /** Reason for workflow selection */
+  routingReason?: string
+  /**
+   * Explicit path to a plan.md override.
+   * Resolution priority:
+   *   1. this path (if it exists)
+   *   2. ~/.fd-plan/<slug>/<topic>/plan.md
+   */
+  plan_file?: string
+}
+
+/** Extended PlanningState with TDD state for internal use */
+export type PlanningStateWithTDD = PlanningState & { tdd: TDDState }
+
+export function getTDDState(state: PlanningState): TDDState | undefined {
+  const tdd = state["tdd"]
+  return typeof tdd === "object" ? tdd as TDDState : undefined
+}
+
+export function parseState(content: string): Record<string, unknown> {
+  const result: Record<string, unknown> = { exists: false }
+
+  // Strip YAML frontmatter and parse its top-level scalar keys
+  let body = content
+  const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/)
+  if (frontmatterMatch) {
+    body = frontmatterMatch[2]
+    for (const line of frontmatterMatch[1].split("\n")) {
+      const fm = line.match(/^([a-z_][a-z0-9_]*):\s*(.+)/)
+      if (fm) {
+        result[fm[1].trim()] = fm[2].trim().replace(/^["']|["']$/g, "")
+      }
+    }
+  }
+
+  // Parse key:value pairs from body — flattened to top level (overrides frontmatter)
+  for (const line of body.split("\n")) {
+    if (line.startsWith("#")) continue
+    const kvMatch = line.match(/^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)/)
+    if (kvMatch) {
+      const key = kvMatch[1].trim()
+      const value = kvMatch[2].trim()
+      if (key === "steps_complete" || key === "steps_pending") {
+        result[key] = value.replace(/[\[\]]/g, "").split(",").map(s => s.trim()).filter(Boolean)
+      } else if (key === "plan_confirmed") {
+        result[key] = value === "true"
+      } else if (key === "requires_design_first" || key === "design_approved" || key === "design_override") {
+        result[key] = value === "true"
+      } else if (key === "skippedStages") {
+        result[key] = value.replace(/[\[\]]/g, "").split(",").map(s => s.trim()).filter(Boolean)
+      } else if (key === "escalationHistory" || key === "routingScores") {
+        try {
+          result[key] = JSON.parse(value)
+        } catch {
+          result[key] = undefined
+        }
+      } else if (value !== "" && !isNaN(Number(value)) && key !== "plan_file" && key !== "confirmed_at" && key !== "topic") {
+        result[key] = Number(value)
+      } else {
+        result[key] = value.replace(/^["']|["']$/g, "")
+      }
+    }
+  }
+
+  result["exists"] = true
+  return result
+}
+
+export function timestamp(): string {
+  return new Date().toISOString()
+}
+
+/**
+ * Returns the canonical initial STATE.md content as a string.
+ * This is the single source of truth for what a fresh STATE.md looks like.
+ */
+export function createDefaultState(phase = 1): string {
+  const now = timestamp()
+  return [
+    "---",
+    `phase: ${phase}`,
+    "status: ready",
+    "plan_confirmed: false",
+    "requires_design_first: false",
+    "design_stage: pending",
+    "design_approved: false",
+    "design_override: false",
+    "steps_complete: []",
+    "steps_pending: []",
+    `last_action: "initialized"`,
+    `next_action: "run /fd-task"`,
+    "blockers: []",
+    `freshnessStatus: "fresh"`,
+    `lastUpdatedAt: "${now}"`,
+    `lastUpdatedBy: "system"`,
+    `lastUpdatedPhase: ${phase}`,
+    "summaryVersion: 1",
+    "---",
+    "",
+    "# Planning State",
+    "",
+    `Initialized at ${now}`,
+  ].join("\n")
+}
+
+/**
+ * Returns the canonical default config.json object.
+ */
+export function createDefaultConfig(): {
+  model_profile: string
+  tdd_enforced: boolean
+  approval_required: boolean
+  default_agent: string
+} {
+  return {
+    model_profile: "balanced",
+    tdd_enforced: true,
+    approval_required: false,
+    default_agent: "orchestrator",
+  }
+}
+
+/**
+ * Update or insert a key:value line in state content.
+ */
+function upsertLine(current: string, key: string, value: string): string {
+  const pattern = new RegExp(`^${key}:\\s*.*$`, "m")
+  if (pattern.test(current)) return current.replace(pattern, `${key}: ${value}`)
+  return `${current.trimEnd()}\n${key}: ${value}\n`
+}
+
+/**
+ * Returns true if state was updated within maxAgeMs milliseconds.
+ * Defaults to 5 minutes.
+ */
+export function isStateFresh(state: PlanningState, maxAgeMs = 5 * 60 * 1000): boolean {
+  if (!state.lastUpdatedAt) return false
+  if (state.freshnessStatus === "stale") return false
+  const age = Date.now() - new Date(state.lastUpdatedAt).getTime()
+  return age < maxAgeMs
+}
+
+/**
+ * Mark the state as stale by updating freshnessStatus and appending to history.
+ */
+export function markStateStale(dir: string): void {
+  const sp = statePath(dir)
+  if (!existsSync(sp)) return
+  let content = readFileSync(sp, "utf-8")
+  content = upsertLine(content, "freshnessStatus", "stale")
+  content = appendHistory(content, "State marked stale — re-exploration required")
+  writeFileSync(sp, content, "utf-8")
+}
+
+/**
+ * Publish a state update with fresh metadata. Called after any significant change.
+ */
+export function publishStateUpdate(dir: string, agent: string, phase: number): void {
+  const sp = statePath(dir)
+  if (!existsSync(sp)) return
+  let content = readFileSync(sp, "utf-8")
+  const now = timestamp()
+
+  // Extract current version or start at 0
+  const currentVersion = parseInt(content.match(/^summaryVersion:\s*(\d+)/m)?.[1] || "0", 10)
+  const newVersion = currentVersion + 1
+
+  content = upsertLine(content, "lastUpdatedAt", `"${now}"`)
+  content = upsertLine(content, "lastUpdatedBy", `"${agent}"`)
+  content = upsertLine(content, "lastUpdatedPhase", `${phase}`)
+  content = upsertLine(content, "summaryVersion", `${newVersion}`)
+  content = upsertLine(content, "freshnessStatus", "fresh")
+  content = appendHistory(content, `State published by ${agent} at phase ${phase} (v${newVersion})`)
+
+  writeFileSync(sp, content, "utf-8")
+}
+
+export function appendHistory(stateContent: string, action: string): string {
+  const entry = `- ${timestamp()} — ${action}`
+  if (stateContent.includes("## Session History")) {
+    return stateContent.replace(/(\n## Session History\n)/, `$1${entry}\n`)
+  }
+  return stateContent + `\n## Session History\n${entry}\n`
+}
+
+export function readPlanningState(dir: string): PlanningState {
+  const sp = statePath(dir)
+  if (!existsSync(sp)) {
+    return {
+      phase: 0,
+      status: "",
+      plan_confirmed: false,
+      requires_design_first: false,
+      design_stage: "pending",
+      design_approved: false,
+      design_override: false,
+      steps_complete: [],
+      steps_pending: [],
+      last_action: "",
+      next_action: "",
+      blockers: [],
+      tdd: undefined,
+      lastUpdatedAt: "",
+      lastUpdatedBy: "",
+      lastUpdatedPhase: 1,
+      summaryVersion: 0,
+      freshnessStatus: "unknown" as const,
+      plan_file: undefined,
+    }
+  }
+  const content = readFileSync(sp, "utf-8")
+  const parsed = parseState(content)
+  return {
+    phase: (parsed.phase as number) || 1,
+    topic: (parsed.topic as string) || undefined,
+    status: (parsed.status as string) || "",
+    plan_confirmed: Boolean(parsed.plan_confirmed),
+    task_type: (parsed.task_type as string) || undefined,
+    requires_design_first: Boolean(parsed.requires_design_first),
+    design_stage: ((parsed.design_stage as PlanningState["design_stage"]) || "pending"),
+    design_approved: Boolean(parsed.design_approved),
+    design_override: Boolean(parsed.design_override),
+    design_override_reason: (parsed.design_override_reason as string) || undefined,
+    design_artifact: (parsed.design_artifact as string) || undefined,
+    steps_complete: (parsed.steps_complete as number[]) || [],
+    steps_pending: (parsed.steps_pending as number[]) || [],
+    last_action: (parsed.last_action as string) || "",
+    next_action: (parsed.next_action as string) || "",
+    blockers: (parsed.blockers as string[]) || [],
+    tdd: parseTDDState(parsed),
+    lastUpdatedAt: (parsed.lastUpdatedAt as string) || "",
+    lastUpdatedBy: (parsed.lastUpdatedBy as string) || "",
+    lastUpdatedPhase: (parsed.lastUpdatedPhase as number) || 1,
+    summaryVersion: (parsed.summaryVersion as number) || 0,
+    freshnessStatus: ((parsed.freshnessStatus as "fresh" | "stale" | "unknown") || "unknown") as PlanningState["freshnessStatus"],
+    workflowClass: (parsed.workflowClass as string) || undefined,
+    skippedStages: (parsed.skippedStages as string[]) || undefined,
+    escalationHistory: (parsed.escalationHistory as PlanningState["escalationHistory"]) || undefined,
+    routingScores: (parsed.routingScores as PlanningState["routingScores"]) || undefined,
+    routingReason: (parsed.routingReason as string) || undefined,
+    plan_file: (parsed.plan_file as string) || undefined,
+  }
+}
+
+export function hasDesignGateSatisfied(state: PlanningState): boolean {
+  if (!state.requires_design_first) return true
+  if (state.design_override) return true
+  return state.design_stage === "handoff_complete" && state.design_approved
+}
+
+/**
+ * Parse TDD state from parsed STATE.md fields.
+ */
+function parseTDDState(parsed: Record<string, unknown>): TDDState | undefined {
+  const tdd = parsed.tdd as string | undefined
+  if (!tdd) return undefined
+
+  try {
+    const obj = JSON.parse(tdd)
+    return {
+      stage: (obj.stage as TDDState["stage"]) || "behavior",
+      cycle: (obj.cycle as number) || 1,
+      behaviors: (obj.behaviors as TDDBehavior[]) || [],
+      regression_test_links: (obj.regression_test_links as string[]) || [],
+      override_log: (obj.override_log as TDDOverride[]) || [],
+      failing_tests: (obj.failing_tests as number) || 0,
+      passing_tests: (obj.passing_tests as number) || 0,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Serialize TDD state to JSON string for storage.
+ */
+function serializeTDDState(tdd: TDDState): string {
+  return JSON.stringify({
+    stage: tdd.stage,
+    cycle: tdd.cycle,
+    behaviors: tdd.behaviors,
+    regression_test_links: tdd.regression_test_links,
+    override_log: tdd.override_log,
+    failing_tests: tdd.failing_tests,
+    passing_tests: tdd.passing_tests,
+  })
+}
+
+export function updateTDDState(dir: string, updates: Partial<TDDState>): void {
+  const sp = statePath(dir)
+  if (!existsSync(sp)) return
+
+  const state = readPlanningState(dir)
+  const existingTdd = state["tdd"] as TDDState | undefined
+  const current: TDDState = existingTdd ?? {
+    stage: "behavior",
+    cycle: 1,
+    behaviors: [],
+    regression_test_links: [],
+    override_log: [],
+    failing_tests: 0,
+    passing_tests: 0,
+  }
+
+  const updated: TDDState = { ...current, ...updates }
+  const tddJson = serializeTDDState(updated)
+
+  let content = readFileSync(sp, "utf-8")
+
+  // Update or insert tdd field in frontmatter
+  if (content.includes("tdd:")) {
+    content = content.replace(/^tdd:.*$/m, `tdd: '${tddJson}'`)
+  } else if (content.startsWith("---")) {
+    const end = content.indexOf("---", 3)
+    if (end !== -1) {
+      content = content.slice(0, end) + "\ntdd: '" + tddJson.replace(/'/g, "''") + "'" + content.slice(end)
+    }
+  }
+
+  content = appendHistory(content, `TDD state updated: stage=${updated.stage}, cycle=${updated.cycle}`)
+  writeFileSync(sp, content, "utf-8")
+}
+
+export function logTDDOverride(dir: string, stage: string, reason: string, override_by: string): void {
+  const state = readPlanningState(dir)
+  const existingTdd = state["tdd"] as TDDState | undefined
+  if (!existingTdd) return
+
+  const override: TDDOverride = {
+    timestamp: timestamp(),
+    stage,
+    reason,
+    override_by,
+  }
+
+  updateTDDState(dir, {
+    override_log: [...existingTdd.override_log, override],
+  })
+}
+
+export function updatePlanningState(dir: string, updates: Partial<PlanningState>): void {
+  const sp = statePath(dir)
+  if (!existsSync(sp)) return
+  let content = readFileSync(sp, "utf-8")
+
+  if (updates.phase !== undefined) {
+    content = upsertLine(content, "phase", `${updates.phase}`)
+    content = appendHistory(content, `Phase changed to ${updates.phase}`)
+  }
+  if (updates.topic !== undefined) {
+    content = upsertLine(content, "topic", `"${slugifyTopic(updates.topic)}"`)
+    content = appendHistory(content, `Topic set to ${slugifyTopic(updates.topic)}`)
+  }
+  if (updates.status !== undefined) {
+    content = upsertLine(content, "status", `${updates.status}`)
+    content = appendHistory(content, `Status changed to ${updates.status}`)
+  }
+  if (updates.last_action !== undefined) {
+    content = upsertLine(content, "last_action", `"${updates.last_action}"`)
+    content = appendHistory(content, updates.last_action)
+  }
+  if (updates.next_action !== undefined) {
+    content = upsertLine(content, "next_action", `"${updates.next_action}"`)
+    content = appendHistory(content, `Next action: ${updates.next_action}`)
+  }
+  if (updates.blockers !== undefined) {
+    const blockersMd = updates.blockers.length > 0
+      ? updates.blockers.map(b => `- ${b}`).join("\n")
+      : "- none"
+    content = content.replace(/^## Blockers\n[\s\S]*?(?=\n##|\n#$)/m, `## Blockers\n${blockersMd}\n`)
+    content = appendHistory(content, `Blockers updated: ${updates.blockers.length} item(s)`)
+  }
+  if (updates.plan_confirmed !== undefined) {
+    content = upsertLine(content, "plan_confirmed", `${updates.plan_confirmed}`)
+    content = appendHistory(content, `Plan confirmed: ${updates.plan_confirmed}`)
+  }
+  if (updates.task_type !== undefined) {
+    content = upsertLine(content, "task_type", `"${updates.task_type}"`)
+    content = appendHistory(content, `Task type set: ${updates.task_type}`)
+  }
+  if (updates.requires_design_first !== undefined) {
+    content = upsertLine(content, "requires_design_first", `${updates.requires_design_first}`)
+    content = appendHistory(content, `requires_design_first: ${updates.requires_design_first}`)
+  }
+  if (updates.design_stage !== undefined) {
+    content = upsertLine(content, "design_stage", `"${updates.design_stage}"`)
+    content = appendHistory(content, `design_stage: ${updates.design_stage}`)
+  }
+  if (updates.design_approved !== undefined) {
+    content = upsertLine(content, "design_approved", `${updates.design_approved}`)
+    content = appendHistory(content, `design_approved: ${updates.design_approved}`)
+  }
+  if (updates.design_override !== undefined) {
+    content = upsertLine(content, "design_override", `${updates.design_override}`)
+    content = appendHistory(content, `design_override: ${updates.design_override}`)
+  }
+  if (updates.design_override_reason !== undefined) {
+    content = upsertLine(content, "design_override_reason", `"${updates.design_override_reason}"`)
+    content = appendHistory(content, `design_override_reason updated`)
+  }
+  if (updates.design_artifact !== undefined) {
+    content = upsertLine(content, "design_artifact", `'${updates.design_artifact.replace(/'/g, "''")}'`)
+    content = appendHistory(content, `design_artifact updated`)
+  }
+  if (updates.steps_complete !== undefined) {
+    content = upsertLine(content, "steps_complete", `[${updates.steps_complete.join(", ")}]`)
+    content = appendHistory(content, `Steps complete: [${updates.steps_complete.join(", ")}]`)
+  }
+  if (updates.steps_pending !== undefined) {
+    content = upsertLine(content, "steps_pending", `[${updates.steps_pending.join(", ")}]`)
+    content = appendHistory(content, `Steps pending: [${updates.steps_pending.join(", ")}]`)
+  }
+  if (updates.workflowClass !== undefined) {
+    content = upsertLine(content, "workflowClass", `"${updates.workflowClass}"`)
+    content = appendHistory(content, `Workflow class: ${updates.workflowClass}`)
+  }
+  if (updates.skippedStages !== undefined) {
+    content = upsertLine(content, "skippedStages", `[${updates.skippedStages.join(", ")}]`)
+    content = appendHistory(content, `Skipped stages: [${updates.skippedStages.join(", ")}]`)
+  }
+  if (updates.routingReason !== undefined) {
+    content = upsertLine(content, "routingReason", `"${updates.routingReason}"`)
+    content = appendHistory(content, `Routing reason: ${updates.routingReason}`)
+  }
+  if (updates.escalationHistory !== undefined) {
+    content = upsertLine(content, "escalationHistory", JSON.stringify(updates.escalationHistory))
+    content = appendHistory(content, `Escalation: ${updates.escalationHistory.length} event(s)`)
+  }
+  if (updates.routingScores !== undefined) {
+    content = upsertLine(content, "routingScores", JSON.stringify(updates.routingScores))
+    content = appendHistory(content, `Routing score: ${updates.routingScores.total.toFixed(2)}`)
+  }
+  // Always update freshness metadata when state is updated
+  const now = timestamp()
+  const currentPhase = (parseState(readFileSync(sp, "utf-8")).phase as number) || 1
+  const currentVersionMatch = content.match(/^summaryVersion:\s*(\d+)/m)
+  const currentVersion = currentVersionMatch ? parseInt(currentVersionMatch[1], 10) : 0
+  const newVersion = currentVersion + 1
+
+  content = upsertLine(content, "lastUpdatedAt", `"${now}"`)
+  content = upsertLine(content, "lastUpdatedBy", `"system"`)
+  content = upsertLine(content, "lastUpdatedPhase", `${currentPhase}`)
+  content = upsertLine(content, "summaryVersion", `${newVersion}`)
+  content = upsertLine(content, "freshnessStatus", "fresh")
+  content = appendHistory(content, `Freshness updated by system at phase ${currentPhase} (v${newVersion})`)
+  writeFileSync(sp, content, "utf-8")
+}
+
+export function findWorkspaceRoot(startDir: string): string | null {
+  let current = startDir
+  for (;;) {
+    const configPath = join(planningDir(current), "config.json")
+    if (existsSync(configPath)) {
+      try {
+        const config = JSON.parse(readFileSync(configPath, "utf-8"))
+        if (config.sub_repos && Array.isArray(config.sub_repos) && config.sub_repos.length > 0) {
+          return current
+        }
+      } catch { /* ignore */ }
+    }
+    const parent = dirname(current)
+    if (parent === current) break
+    current = parent
+  }
+  return null
+}
+
+export function resolveSubRepos(configPath: string, subRepos: string[]): string[] {
+  const configDir = dirname(configPath)
+  return subRepos.map(r => {
+    if (resolve(r) === r) return r
+    return resolve(configDir, r)
+  })
+}
+
+export function getWorkspaceConfig(dir: string): { sub_repos: string[] | null, workspace_mode: "shared" | "per-repo", workspace_root?: string } | null {
+  const root = findWorkspaceRoot(dir)
+  if (!root) return null
+  const configPath = join(planningDir(root), "config.json")
+  if (!existsSync(configPath)) return null
+  try {
+    const config = JSON.parse(readFileSync(configPath, "utf-8"))
+    return {
+      sub_repos: Array.isArray(config.sub_repos) ? config.sub_repos : null,
+      workspace_mode: (config.workspace_mode === "per-repo" ? "per-repo" : "shared"),
+      workspace_root: config.workspace_root || undefined,
+    }
+  } catch {
+    return null
+  }
+}
+
+export interface BuildContextPacketOpts {
+  /** File paths and symbols involved, with line numbers if known. */
+  targets?: string
+  /** Files/symbols affected — from fdx-impact or codegraph. */
+  blastRadius?: string
+  /** Established project conventions relevant to the task (1–3). */
+  patterns?: string[]
+  /** Repo-memory findings relevant to the task. */
+  lessons?: string
+  /** Prototype of 1–3 most relevant symbols (signature + doc comment only). */
+  keyImports?: string
+  /** Hard rules from load-rules or planning-state that apply here. */
+  constraints?: string
+  /** Current phase number from STATE.md. */
+  phase?: number
+  /** Current stage name. */
+  stage?: string
+  /** Steps completed so far in this phase. */
+  stepsComplete?: string[]
+  /** Steps still pending. */
+  stepsPending?: string[]
+}
+
+/**
+ * Format an orchestrator research packet as a compact context block string.
+ *
+ * The orchestrator runs pre-flight research (fdx-outline, fdx-impact, repo-memory,
+ * codebase-state) and prepends the result to every `task` tool delegation so
+ * subagents don't re-run the same research. This helper produces that block.
+ *
+ * Sections with no findings are omitted. The block stays under 400 tokens when
+ * the caller trims based on relevance to the receiving agent.
+ *
+ * @example
+ *   buildContextPacket({
+ *     targets: "src/agents/orchestrator.ts:96",
+ *     blastRadius: "no callers — orchestrator-only prompt",
+ *     phase: 1,
+ *     stage: "execute",
+ *     stepsComplete: ["plan"],
+ *     stepsPending: ["execute", "verify"],
+ *   })
+ */
+export function buildContextPacket(opts: BuildContextPacketOpts): string {
+  const lines: string[] = ["## Orchestrator Context (do not re-research — already done)"]
+  if (opts.targets)     lines.push(`**Target:** ${opts.targets}`)
+  if (opts.blastRadius) lines.push(`**Blast radius:** ${opts.blastRadius}`)
+  if (opts.patterns?.length) lines.push(`**Established patterns:** ${opts.patterns.join("; ")}`)
+  if (opts.lessons)     lines.push(`**Prior lessons:** ${opts.lessons}`)
+  if (opts.keyImports)  lines.push(`**Key imports:**\n${opts.keyImports}`)
+  if (opts.constraints) lines.push(`**Constraints:** ${opts.constraints}`)
+  if (opts.phase != null) {
+    lines.push(
+      `**Phase context:** phase ${opts.phase}, stage: ${opts.stage ?? "?"}, ` +
+      `done: [${(opts.stepsComplete ?? []).join(", ")}], ` +
+      `pending: [${(opts.stepsPending ?? []).join(", ")}]`
+    )
+  }
+  return lines.join("\n")
+}

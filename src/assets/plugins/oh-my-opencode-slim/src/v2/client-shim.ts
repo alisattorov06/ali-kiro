@@ -1,0 +1,782 @@
+/**
+ * v1 PluginInput shim (real delegation).
+ *
+ * The v1 plugin factory expects a `PluginInput` with an HTTP `client`,
+ * project metadata, and a shell. v2's plugin context exposes none of these,
+ * so this shim builds a v1-shaped input whose `client` translates the v1
+ * SDK call shapes (Hono-style `{path, body}` or flat `{sessionID}`) into
+ * v2 flat session calls (`get`/`remove`/`list`/`interrupt`/`switchModel`/
+ * `prompt`/`context`). Delegation is real where the v2 host provides the
+ * method and explicitly fails or degrades with a log where it does not —
+ * the shim never fakes success shapes.
+ *
+ * The v2 model-switch semantics (prompts carry no model; `switchModel`
+ * must precede the prompt) are encapsulated in the `promptAsync`
+ * translation, which is what lets the v1 foreground-fallback pipeline work
+ * unmodified on v2. A failed `switchModel` degrades to steering on the
+ * current model (logged, `switched: false` on the result) because the
+ * prompt delivery is the load-bearing action; a host with NO
+ * `switchModel` rejects callers that declare `modelSwitch: 'required'`
+ * (foreground-fallback) while pin-callers (orchestrator-wake) keep the
+ * logged steer.
+ */
+
+import { isRecord } from '../utils/guards';
+import {
+  INTERNAL_INITIATOR_METADATA_KEY,
+  isInternalInitiatorPart,
+} from '../utils/internal-initiator';
+import { log } from '../utils/logger';
+import {
+  createInternalSyntheticMessageID,
+  recordInternalAdmission,
+} from './internal-admissions';
+import type { V2Context } from './types';
+
+/** v2 model reference accepted by `ctx.generate.text`. */
+export interface V2GenerateModelRef {
+  id: string;
+  providerID: string;
+  variant?: string;
+}
+
+/** Optional v2 capabilities threaded into the v1 PluginInput. Absent
+ * capabilities must leave the input object unchanged (v1 parity). */
+export interface ExperimentalV2 {
+  /** Queued prompts preserve caller-chosen message IDs in session.context. */
+  queuedPromptIdentity?: true;
+  /** Real host wait; not a snapshot, and not abortable by the 2.0.5 adapter. */
+  waitForSessionIdle?: (sessionID: string) => Promise<void>;
+  /** One-shot generation (`ctx.generate.text`); no session involved. */
+  generateText?: (
+    prompt: string,
+    model?: V2GenerateModelRef,
+  ) => Promise<{ text: string }>;
+}
+
+/** Directory from the host-reported location; cwd on hosts without
+ * `ctx.location` (or with an empty directory). */
+export function resolveV2Directory(ctx: V2Context): string {
+  const directory = ctx.location?.directory;
+  return typeof directory === 'string' && directory ? directory : process.cwd();
+}
+
+/** Accept both Hono-style ({path:{id}}) and flat ({sessionID}) calls. */
+function sessionIDOf(args: Record<string, unknown>): string {
+  return (
+    (args?.path as { id?: string } | undefined)?.id ??
+    (args?.sessionID as string | undefined) ??
+    ''
+  );
+}
+
+/** Join the text parts of a v1 prompt body into v2 prompt text. */
+function textFromBody(args: Record<string, unknown>): string {
+  const body = (args?.body ?? {}) as {
+    parts?: Array<{ type?: string; text?: string }>;
+  };
+  const parts = Array.isArray(body.parts) ? body.parts : [];
+  return parts
+    .filter((p) => p?.type === 'text' && typeof p.text === 'string')
+    .map((p) => p.text as string)
+    .join('\n');
+}
+
+/** Map non-text v1 prompt parts (images, files) into v2 prompt `files`
+ * entries. The fallback replay must not silently drop attachments: v1's
+ * prompt API carries parts natively, so a text-only translation would
+ * resend an attachment-dependent request without its content. Parts whose
+ * uri cannot be derived are logged and skipped (honest degradation). */
+function filesFromBody(
+  args: Record<string, unknown>,
+): Array<{ uri: string; name?: string }> {
+  const body = (args?.body ?? {}) as {
+    parts?: Array<Record<string, unknown>>;
+  };
+  const parts = Array.isArray(body.parts) ? body.parts : [];
+  const files: Array<{ uri: string; name?: string }> = [];
+  for (const p of parts) {
+    if (!p || typeof p !== 'object') continue;
+    if (p.type === 'text') continue;
+    const uri = [p.uri, p.url].find((v) => typeof v === 'string' && v) as
+      | string
+      | undefined;
+    if (!uri) {
+      log('[v2][shim] non-text prompt part without uri dropped', {
+        type: typeof p.type === 'string' ? p.type : 'unknown',
+      });
+      continue;
+    }
+    const name =
+      (p.filename as string | undefined) ?? (p.name as string | undefined);
+    files.push({ uri, ...(name ? { name } : {}) });
+  }
+  return files;
+}
+
+/** v2 transcript message (content parts) → v1 SDK message view
+ * (`{info: {id, role}, parts}`) expected by the v1 pipeline.
+ *
+ * Terminal metadata is preserved, not reduced: `session.context` returns
+ * full `SessionMessage.Info` entries (schema-verified upstream), where
+ * assistant entries carry `time.completed` (set when the turn
+ * finalizes), `finish`, and `error`, and tool parts carry `state.status`
+ * in the v1 vocabulary. The old `{id, role}`-only reduction degraded
+ * every downstream classification — completion times were unreadable
+ * (eternal "pending") and finish/error states were invisible — which
+ * starved the terminal gate's transcript publish path on v2 hosts
+ * (live-verified 2.0.8 incident).
+ *
+ * The 2.0.8 `idle` marker (`{type: 'idle', time, outcome}`) trails every
+ * finished session. It is a lifecycle boundary, never content, and has
+ * no v1 transcript equivalent, so it maps to the v1 `system` role — the
+ * role transcript consumers already skip when scanning for the trailing
+ * turn. Every other entry keeps its v2 role name. */
+function messageTime(time: unknown): Record<string, unknown> | undefined {
+  if (typeof time === 'number' && Number.isFinite(time))
+    return { created: time };
+  if (!isRecord(time)) return undefined;
+  return time;
+}
+
+function toV1Message(m: Record<string, unknown>) {
+  const sourceType = typeof m.type === 'string' ? m.type : undefined;
+  const role = sourceType === 'idle' ? 'system' : (sourceType ?? m.role);
+  const time = messageTime(m.time);
+  const contentParts = Array.isArray(m.content)
+    ? (m.content as Array<Record<string, unknown>>).map((part) => ({ ...part }))
+    : [];
+  const text =
+    contentParts.length === 0 && typeof m.text === 'string'
+      ? m.text
+      : contentParts.length === 0 &&
+          isRecord(m.payload) &&
+          typeof m.payload.text === 'string'
+        ? m.payload.text
+        : undefined;
+  return {
+    info: {
+      id: m.id,
+      role,
+      ...(typeof sourceType === 'string' ? { sourceType } : {}),
+      ...(typeof m.agent === 'string' ? { agent: m.agent } : {}),
+      ...(typeof m.parentID === 'string' ? { parentID: m.parentID } : {}),
+      ...(typeof m.outcome === 'string' ? { outcome: m.outcome } : {}),
+      ...(time ? { time } : {}),
+      ...(m.finish !== undefined ? { finish: m.finish } : {}),
+      ...(m.error !== undefined ? { error: m.error } : {}),
+    },
+    parts: text === undefined ? contentParts : [{ type: 'text', text }],
+  };
+}
+
+/**
+ * One-time degradation notices for host surfaces the v2 plugin session
+ * domain does not expose. Verified against the upstream promise-plugin
+ * adapter (`packages/plugin/src/promise/{session,adapter}.ts`): the
+ * domain is built with exactly create/get/switchAgent/switchModel/
+ * prompt/generate/command/synthetic/interrupt/update/move/wait/context —
+ * NO `list` and NO `remove`. On such hosts the `list` shim used to
+ * return the empty page silently (children enumeration quietly fell
+ * back to event tracking) and `delete` logged a no-op notice per call.
+ * Both now emit ONE deterministic warning per setup generation
+ * (module-level latch, rearmed by resetClientShimGenerationWarnings —
+ * `opencode reload` reuses the process, so a new generation must not
+ * inherit the previous one's silence; fixed text, no timestamps or
+ * per-call ids) so a missing host capability stays observable in the
+ * plugin log without per-poll noise.
+ */
+let warnedListUnavailable = false;
+let warnedRemoveUnavailable = false;
+
+/** Rearm the one-time degradation notices for a new setup generation.
+ *  Called by resetV2GenerationWarnings at setup entry (and directly by
+ *  tests): module state survives instance disposal inside one process. */
+export function resetClientShimGenerationWarnings(): void {
+  warnedListUnavailable = false;
+  warnedRemoveUnavailable = false;
+}
+
+/** v1 body model (`{providerID, modelID}`) → v2 model ref
+ * (`{id, providerID}`). */
+function modelRefFromBody(body: {
+  model?: {
+    id?: string;
+    modelID?: string;
+    providerID?: string;
+    variant?: string;
+  };
+}): V2GenerateModelRef | undefined {
+  const model = body.model;
+  if (!model) return undefined;
+  const id = model.id ?? model.modelID ?? '';
+  const providerID = model.providerID ?? '';
+  return id && providerID
+    ? {
+        id,
+        providerID,
+        ...(typeof model.variant === 'string'
+          ? { variant: model.variant }
+          : {}),
+      }
+    : undefined;
+}
+
+/**
+ * Internal-initiator marker for v2 prompts: the v1 part metadata is lost
+ * in the text-only v2 translation, so the marker travels as prompt
+ * `metadata` (accepted and propagated by the v2 session.prompt endpoint
+ * and its hook). The session-prompt bridge restores it onto the rebuilt
+ * v1 parts view so `isInternalInitiatorPart` consumers — notably
+ * orchestrator-wake's `observeChatMessage`, which must NOT treat a wake
+ * admission as external user activity (the two-wake no-progress cap
+ * depends on that) — keep working on v2.
+ */
+function internalInitiatorMetadataFromBody(
+  args: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const body = (args?.body ?? {}) as {
+    parts?: Array<Record<string, unknown>>;
+  };
+  const parts = Array.isArray(body.parts) ? body.parts : [];
+  return parts.some((part) => isInternalInitiatorPart(part))
+    ? { [INTERNAL_INITIATOR_METADATA_KEY]: true }
+    : undefined;
+}
+
+/**
+ * Pure-internal routing gate: ONLY bodies whose every part is an internal
+ * initiator may take the session.synthetic admission. Mixed bodies —
+ * notably foreground-fallback's replay of the user's real parts with an
+ * appended internal reminder — must stay on session.prompt so they remain
+ * persisted user input and keep their file attachments (the synthetic
+ * branch forwards text only). See the mixed-replay regression test and
+ * the greptile P1 review on #1158.
+ */
+function isPureInternalInitiatorBody(args: Record<string, unknown>): boolean {
+  const body = (args?.body ?? {}) as {
+    parts?: Array<Record<string, unknown>>;
+  };
+  const parts = Array.isArray(body.parts) ? body.parts : [];
+  return (
+    parts.length > 0 && parts.every((part) => isInternalInitiatorPart(part))
+  );
+}
+
+/**
+ * Map one v2 `Session.Info` to the v1 list shape the shim's consumers
+ * read (interview dashboard directory discovery: `directory`,
+ * `time.updated`; identity fields for any future consumer). Only fields
+ * with the right type are copied — nothing is fabricated (no invented
+ * `version`/`title` defaults).
+ */
+function toV1SessionInfo(
+  info: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (typeof info.id === 'string') out.id = info.id;
+  if (typeof info.parentID === 'string') out.parentID = info.parentID;
+  if (typeof info.projectID === 'string') out.projectID = info.projectID;
+  if (typeof info.title === 'string') out.title = info.title;
+  if (typeof info.agent === 'string') out.agent = info.agent;
+  // v2 Session.Info.outcome appears only on terminal transition
+  // (succeeded|failed|interrupted); orchestrator-wake's children-driven
+  // mode reads it as the terminal signal.
+  if (typeof info.outcome === 'string') out.outcome = info.outcome;
+  if (isRecord(info.model)) out.model = info.model;
+  if (isRecord(info.metadata)) out.metadata = info.metadata;
+  // v2 carries the directory on `location` (Location.Ref); v1 had it flat.
+  if (isRecord(info.location)) {
+    if (typeof info.location.directory === 'string') {
+      out.directory = info.location.directory;
+    }
+  }
+  if (typeof info.directory === 'string') out.directory = info.directory;
+  if (isRecord(info.time)) {
+    const time: Record<string, unknown> = {};
+    if (typeof info.time.created === 'number') time.created = info.time.created;
+    if (typeof info.time.updated === 'number') time.updated = info.time.updated;
+    if (typeof info.time.idle === 'number') time.idle = info.time.idle;
+    if (Object.keys(time).length > 0) out.time = time;
+  }
+  return out;
+}
+
+/**
+ * v1 `client.session.list` over v2 `session.list`. Accepts the v1
+ * `{query}` call shape (or a flat query object); passes through the
+ * filters shim callers use — `directory` and the `parentID` filter
+ * (session id or root-only: the literal `"null"` string, with a real
+ * `null` normalized to it) — and wraps the mapped page in the v1
+ * `{data}` envelope. Hosts without `session.list` keep the v1-parity
+ * empty page (honest absence, not a fake success) after a one-time
+ * per-generation warning — stock v2 hosts match this path because the
+ * plugin session domain does not expose `list` (see the notice above).
+ */
+export function createSessionListShim(
+  s: V2Context['session'],
+): (args: Record<string, unknown>) => Promise<{ data: unknown[] }> {
+  return async (args) => {
+    if (typeof s.list !== 'function') {
+      if (!warnedListUnavailable) {
+        warnedListUnavailable = true;
+        log(
+          '[v2][shim] session.list unavailable on this host build; children enumeration falls back to event tracking',
+        );
+      }
+      return { data: [] };
+    }
+    const query = ((args?.query as Record<string, unknown> | undefined) ??
+      (args as Record<string, unknown> | undefined) ??
+      {}) as Record<string, unknown>;
+    const input: Record<string, unknown> = {};
+    if (typeof query.directory === 'string' && query.directory) {
+      input.directory = query.directory;
+    }
+    if (query.parentID === null) {
+      input.parentID = 'null'; // root-only sentinel on the wire
+    } else if (typeof query.parentID === 'string' && query.parentID !== '') {
+      input.parentID = query.parentID;
+    }
+    const output = (await s.list(input)) as
+      | { data?: unknown }
+      | Array<Record<string, unknown>>
+      | undefined;
+    const infos = Array.isArray(output)
+      ? output
+      : isRecord(output) && Array.isArray(output.data)
+        ? (output.data as Array<Record<string, unknown>>)
+        : [];
+    return { data: infos.filter(isRecord).map(toV1SessionInfo) };
+  };
+}
+
+/** Build a v1-compatible input. Optional host idle-wait and one-shot generation
+ * share experimental_v2; absent capabilities are never replaced with stubs. */
+export function buildPluginInput(
+  ctx: V2Context,
+  extras?: ExperimentalV2,
+): Record<string, unknown> {
+  // Null-safe: reduced hosts may load the factory without a session domain;
+  // every method then degrades honestly instead of crashing construction.
+  const s = (ctx.session ?? {}) as V2Context['session'];
+  const client = {
+    session: {
+      // `get` is exposed only when the host provides session.get — callers
+      // like task-result probe method presence as the capability signal,
+      // so a degraded stub here would fake verification ability.
+      ...(s.get
+        ? {
+            get: async (args: Record<string, unknown>) => ({
+              data: await s.get?.({ sessionID: sessionIDOf(args) }),
+            }),
+          }
+        : {}),
+      abort: s.interrupt
+        ? async (args: Record<string, unknown>) =>
+            s.interrupt?.({ sessionID: sessionIDOf(args), resume: false })
+        : async (args: Record<string, unknown>) => {
+            log('[v2][shim] session.interrupt unavailable', {
+              id: sessionIDOf(args),
+            });
+          },
+      // `messages` is exposed only when the host provides
+      // session.context — the terminal gate's transcriptSourceAbsent
+      // predicate methods-presence as the capability signal, and a
+      // fake-empty `{data: []}` stub here would read as "source present
+      // but empty" (classifier verdict `absent` → a baseline-less child
+      // STOPPED_WITHOUT_TERMINAL_RESULT) instead of honest capability
+      // absence (same no-fake-success doctrine as the `get` omission
+      // above).
+      ...(s.context
+        ? {
+            messages: async (args: Record<string, unknown>) => {
+              const context = s.context;
+              if (!context) {
+                throw new Error('[v2] session.context is unavailable');
+              }
+              const query = isRecord(args?.query) ? args.query : undefined;
+              const limit = query?.limit;
+              // Bounded tail read (foreground-fallback replay): the v2
+              // messages route paginates natively, so `limit` maps to the
+              // LAST N projected messages newest-first, reversed back to
+              // the v1 ascending shape. Hosts without the route keep the
+              // full context read.
+              if (
+                typeof limit === 'number' &&
+                Number.isFinite(limit) &&
+                limit > 0 &&
+                typeof s.messages === 'function'
+              ) {
+                const page = await s.messages({
+                  sessionID: sessionIDOf(args),
+                  limit,
+                  order: 'desc',
+                });
+                if (!isRecord(page) || !Array.isArray(page.data)) {
+                  throw new Error(
+                    '[v2] session.messages did not return a page',
+                  );
+                }
+                const preserved: Record<string, unknown> = {
+                  data: page.data
+                    .slice()
+                    .reverse()
+                    .map((message) =>
+                      toV1Message(
+                        isRecord(message) ? message : { type: 'unknown' },
+                      ),
+                    ),
+                };
+                if ('cursor' in page) preserved.cursor = page.cursor;
+                if ('next' in page) preserved.next = page.next;
+                return preserved;
+              }
+              const raw = await context({
+                sessionID: sessionIDOf(args),
+              });
+              if (!Array.isArray(raw) || !raw.every(isRecord)) {
+                throw new Error('[v2] session.context did not return an array');
+              }
+              const cut = raw.some(
+                (message) =>
+                  message.type === 'compaction' &&
+                  message.status === 'completed',
+              );
+              return {
+                data: raw.map(toV1Message),
+                page: { source: 'session.context', complete: !cut },
+              };
+            },
+          }
+        : {}),
+      // `status` is intentionally OMITTED: v2 has no equivalent of the v1
+      // live session-status map, and a stub returning `{data: {}}` would be
+      // an empty-but-valid map. getRuntimeSessionStatusSnapshot treats
+      // "status is a function" as the capability signal, so the stub let
+      // stop-confirmation mark still-running background jobs `stopped`
+      // after the grace (false terminalization). With the method absent,
+      // the lookup throws → snapshot.error → the reconciler's safe
+      // markStatusUncertain branch.
+      list: createSessionListShim(s),
+      prompt: s.prompt
+        ? async (args: Record<string, unknown>) => {
+            const body = isRecord(args.body) ? args.body : {};
+            if (
+              ['agent', 'model', 'variant'].some(
+                (key) => body[key] !== undefined,
+              )
+            ) {
+              throw new Error(
+                '[v2] session.prompt cannot represent selection overrides (agent/model/variant); inherit the persisted session selection',
+              );
+            }
+            const files = filesFromBody(args);
+            // `delivery` decides the inbox consumption boundary
+            // (idle queue vs next supported step of the current run)
+            // while `resume` decides waking; both are independent.
+            // An explicit body.delivery of 'steer' opts a noReply
+            // write into steering; anything else stays queued.
+            return s.prompt?.({
+              sessionID: sessionIDOf(args),
+              text: textFromBody(args),
+              ...(body.noReply === true
+                ? ({
+                    delivery:
+                      (body as { delivery?: unknown }).delivery === 'steer'
+                        ? 'steer'
+                        : 'queue',
+                    resume: false,
+                  } as const)
+                : ({ delivery: 'steer' } as const)),
+              ...(files.length > 0 ? { files } : {}),
+            });
+          }
+        : async () => {
+            throw new Error('[v2] session.prompt unavailable');
+          },
+      // v1 prompt_async QUEUED its prompt. The optional `delivery` argument
+      // lets callers preserve that on v2 ('queue' — orchestrator-wake);
+      // the default stays 'steer' because the foreground-fallback replay
+      // must steer an in-flight run. The optional `modelSwitch` argument
+      // declares caller intent for the body model: 'required'
+      // (foreground-fallback — the model is the fallback TARGET, so a host
+      // without session.switchModel must fail loudly instead of silently
+      // replaying on the model that just failed); default callers pass the
+      // session's CURRENT model as a pin (orchestrator-wake) and keep the
+      // honest degrade-with-log steer. The optional `modelSelection:
+      // 'inherit'` argument opts a pure-internal caller into LIFECYCLE
+      // continuation semantics (#1079): the body pin is a snapshot, so the
+      // host's persisted selection wins and switchModel is skipped. Callers
+      // with a REAL pin must not pass it (interview continuations track
+      // their own model and keep the switch).
+      promptAsync: async (
+        args: Record<string, unknown> & {
+          delivery?: 'steer' | 'queue';
+          modelSwitch?: 'required';
+          modelSelection?: 'inherit';
+          modelVariant?: string;
+        },
+      ) => {
+        const delivery = args?.delivery === 'queue' ? 'queue' : 'steer';
+        const body = (args?.body ?? {}) as Parameters<
+          typeof modelRefFromBody
+        >[0] & {
+          messageID?: string;
+          parts?: Array<{ type?: string; text?: string }>;
+        };
+        const metadata = internalInitiatorMetadataFromBody(args);
+        // Internal-initiator injections (orchestrator-wake nudges, interview
+        // continuation) must not be persisted as user input on v2: the flat
+        // session.prompt translation drops the v1 part-level `synthetic`
+        // flag, which regressed them into visible user bubbles. v2's
+        // dedicated session.synthetic admission keeps the text model-visible
+        // while skipping user-message persistence, and its default `resume`
+        // preserves the wake semantics. ONLY purely-internal bodies take
+        // this route — mixed bodies (foreground-fallback's user-parts +
+        // internal reminder replay) must stay on session.prompt to preserve
+        // user-input persistence and file attachments. Hosts without
+        // session.synthetic keep the pre-fix prompt path (visible wake,
+        // metadata intact).
+        const internalViaSynthetic =
+          isPureInternalInitiatorBody(args) &&
+          typeof s.synthetic === 'function';
+        if (!s.prompt && !internalViaSynthetic) {
+          throw new Error('[v2] session.prompt unavailable for promptAsync');
+        }
+        if (metadata !== undefined && !internalViaSynthetic) {
+          log(
+            '[v2][shim] session.synthetic unavailable; internal wake admitted as a visible prompt',
+            { id: sessionIDOf(args) },
+          );
+        }
+        const ref = modelRefFromBody(body);
+        let switched = false;
+        // Lifecycle continuations that OPT IN via `modelSelection:
+        // 'inherit'` (wake / terminal notify) take the host's persisted
+        // selection: their body pin — with or without variant — is a
+        // snapshot that can be stale by delivery time (#1079). Purely
+        // internal bodies WITHOUT the flag keep the pin semantics: the
+        // interview runtime tracks its own model and must keep switching.
+        // Mixed bodies (foreground-fallback replay) still switch;
+        // `modelSwitch: 'required'` still switches.
+        const inheritPersistedSelection =
+          args?.modelSelection === 'inherit' &&
+          args?.modelSwitch !== 'required';
+        if (ref && !inheritPersistedSelection) {
+          // `modelVariant` carries the variant for v2; `body.variant` is
+          // the v1 channel. A non-empty string overrides the ref's variant
+          // so switchModel does not reset it to the host default.
+          const explicitVariant =
+            typeof args?.modelVariant === 'string' && args.modelVariant
+              ? args.modelVariant
+              : undefined;
+          const switchRef = explicitVariant
+            ? { ...ref, variant: explicitVariant }
+            : ref;
+          // Variant preservation: pin-callers that name the session's
+          // CURRENT model without a variant opinion must not reset the
+          // host-side reasoning-effort variant (wake-variant-reset).
+          // Explicit variants and required fallback switches still
+          // switch. Hosts without session.get keep the legacy switch.
+          let skipSwitch = false;
+          if (s.get && args?.modelSwitch !== 'required') {
+            try {
+              const info = await s.get({ sessionID: sessionIDOf(args) });
+              const current = isRecord(info) ? info.model : undefined;
+              const pinMatchesCurrent =
+                isRecord(current) &&
+                current.providerID === switchRef.providerID &&
+                current.id === switchRef.id;
+              if (pinMatchesCurrent && !explicitVariant) {
+                skipSwitch = true;
+              }
+            } catch {
+              // Fail-soft: cannot prove the pin matches — switch as before.
+            }
+          }
+          if (skipSwitch) {
+            // The session already runs the pinned model (with its current
+            // variant); the switch claim stays truthful without a call.
+            switched = true;
+            log(
+              '[v2][shim] pin matches current model; variant-preserving skip of session.switchModel',
+              { id: sessionIDOf(args), model: switchRef },
+            );
+          } else if (s.switchModel) {
+            // The prompt delivery is the load-bearing action: a failed
+            // model switch degrades to steering on the CURRENT model
+            // (logged here; `switched: false` on the result) instead of
+            // aborting the caller's fallback chain (upstream #1125).
+            try {
+              await s.switchModel({
+                sessionID: sessionIDOf(args),
+                model: switchRef,
+              });
+              switched = true;
+            } catch (err) {
+              log('[v2][shim] session.switchModel failed', {
+                id: sessionIDOf(args),
+                model: switchRef,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          } else if (args?.modelSwitch === 'required') {
+            const switchErr = new Error(
+              '[v2] host provides no session.switchModel; cannot switch model for fallback prompt',
+            );
+            switchErr.name = 'V2SwitchModelUnavailableError';
+            throw switchErr;
+          } else {
+            log(
+              '[v2][shim] session.switchModel unavailable; steering on the current model',
+              { id: sessionIDOf(args) },
+            );
+          }
+        } else if (inheritPersistedSelection && ref) {
+          log(
+            '[v2][shim] internal continuation inherits persisted host selection; skip session.switchModel',
+            { id: sessionIDOf(args), model: ref },
+          );
+        }
+        if (internalViaSynthetic) {
+          // Client-chosen message id: v2 `Session.synthetic` honors
+          // `input.id` and preserves it on the LLM context message, so the
+          // admission can be recorded BEFORE the context event carries it —
+          // synthetic admissions skip the prompt hook and the host drops
+          // synthetic metadata from the LLM envelope, so without this the
+          // chat-headers bridge could never classify the wake request.
+          const internalMessageID = createInternalSyntheticMessageID();
+          recordInternalAdmission(sessionIDOf(args), internalMessageID);
+          const result = await s.synthetic?.({
+            sessionID: sessionIDOf(args),
+            id: internalMessageID,
+            text: textFromBody(args),
+            description: 'oh-my-opencode-slim internal initiator',
+            ...(metadata ? { metadata } : {}),
+            delivery,
+            resume: true,
+          });
+          // `switched` reports whether the requested model switch was
+          // CONFIRMED — same contract as the prompt path below.
+          return isRecord(result) ? { ...result, switched } : { switched };
+        }
+        const files = filesFromBody(args);
+        // Reachable only when s.prompt exists (the guard above throws
+        // otherwise and internalViaSynthetic returned early).
+        const result = await s.prompt?.({
+          sessionID: sessionIDOf(args),
+          ...(body.messageID ? { id: body.messageID } : {}),
+          text: textFromBody(args),
+          delivery,
+          ...(files.length > 0 ? { files } : {}),
+          ...(metadata ? { metadata } : {}),
+        });
+        // `switched` reports whether the requested model switch was
+        // CONFIRMED, letting callers gate model-switch bookkeeping on the
+        // truth (foreground-fallback's "switched to fallback model"
+        // claim). Additive over the v2 ack record; callers that ignore
+        // the result are unaffected.
+        return isRecord(result) ? { ...result, switched } : { switched };
+      },
+      update: s.update
+        ? async (args: Record<string, unknown>) => {
+            const body = (args?.body ?? {}) as { title?: string };
+            return s.update?.({
+              sessionID: sessionIDOf(args),
+              ...(typeof body.title === 'string' ? { title: body.title } : {}),
+            });
+          }
+        : async (args: Record<string, unknown>) => {
+            log('[v2][shim] session.update unavailable', {
+              id: sessionIDOf(args),
+            });
+          },
+      // v2 removed the delete endpoint in name only: `session.remove` is
+      // the same DELETE /api/session/:id. Capability-probed like `get`
+      // above. Hosts without `remove` (the stock v2 plugin session domain
+      // — see the one-time notice block near the top of this file) degrade
+      // to a no-op with a single per-generation warning (no fake success,
+      // no per-call noise).
+      delete: s.remove
+        ? async (args: Record<string, unknown>) => {
+            await s.remove?.({ sessionID: sessionIDOf(args) });
+          }
+        : async () => {
+            if (!warnedRemoveUnavailable) {
+              warnedRemoveUnavailable = true;
+              log(
+                '[v2][shim] session.remove unavailable on this host build; session delete is a no-op',
+              );
+            }
+          },
+    },
+    ...(typeof ctx.permission?.reply === 'function'
+      ? {
+          permission: {
+            reply: async (args: Record<string, unknown>) =>
+              ctx.permission?.reply({
+                sessionID: sessionIDOf(args),
+                requestID:
+                  typeof args.requestID === 'string' ? args.requestID : '',
+                decision:
+                  args.reply === 'always' || args.reply === 'reject'
+                    ? args.reply
+                    : 'once',
+                ...(typeof args.message === 'string'
+                  ? { message: args.message }
+                  : {}),
+              }),
+          },
+        }
+      : {}),
+    app: {
+      log: async (args?: Record<string, unknown>) => {
+        const body = (args?.body ?? args) as
+          | { level?: string; message?: string }
+          | undefined;
+        const level = body?.level ?? 'info';
+        log(`[v2][host-log] ${level}: ${body?.message ?? ''}`);
+      },
+    },
+    tui: {
+      showToast: async (args?: Record<string, unknown>) => {
+        const body = (args?.body ?? args) as { message?: string } | undefined;
+        log('[v2][shim] tui.showToast (no-op on v2)', {
+          message: body?.message,
+        });
+      },
+    },
+  };
+
+  const directory = resolveV2Directory(ctx);
+  const wait = typeof s.wait === 'function' ? s.wait.bind(s) : undefined;
+  return {
+    client,
+    hostFlavor: 'v2',
+    project: {
+      id: ctx.location?.project?.id ?? 'global',
+      directory,
+    },
+    directory,
+    worktree: directory,
+    experimental_workspace: { register() {} },
+    $: typeof Bun !== 'undefined' ? Bun.$ : undefined,
+    ...(extras?.generateText || wait || (s.prompt && s.context)
+      ? {
+          experimental_v2: {
+            ...(s.prompt && s.context ? { queuedPromptIdentity: true } : {}),
+            ...(extras?.generateText
+              ? { generateText: extras.generateText }
+              : {}),
+            ...(wait
+              ? {
+                  waitForSessionIdle: (sessionID: string) =>
+                    wait({ sessionID }),
+                }
+              : {}),
+          },
+        }
+      : {}),
+  };
+}

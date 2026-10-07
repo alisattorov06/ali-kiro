@@ -1,0 +1,5 @@
+{
+  "plugins": [
+    "@tarquinen/opencode-dcp@latest"
+  ]
+}

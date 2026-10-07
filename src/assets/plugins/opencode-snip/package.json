@@ -1,0 +1,50 @@
+{
+  "name": "opencode-snip",
+  "description": "OpenCode plugin that prefixes shell commands with snip to reduce LLM token consumption",
+  "type": "module",
+  "main": ".opencode/plugins/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "snip",
+    "llm",
+    "tokens",
+    "cli"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/VincentHardouin/opencode-snip",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/VincentHardouin/opencode-snip"
+  },
+  "engines": {
+    "node": "^24"
+  },
+  "files": [
+    ".opencode",
+    "src"
+  ],
+  "release": {
+    "branches": [
+      "main"
+    ],
+    "plugins": [
+      "@semantic-release/commit-analyzer",
+      "@semantic-release/release-notes-generator",
+      "@semantic-release/npm",
+      "@semantic-release/github"
+    ]
+  }
+}

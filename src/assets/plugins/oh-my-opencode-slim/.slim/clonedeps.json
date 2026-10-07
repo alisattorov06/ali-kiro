@@ -1,0 +1,51 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-09-09T00:00:00.000Z",
+  "dependencies": [
+    {
+      "name": "@opencode-ai/plugin",
+      "resolvedVersion": "1.18.13",
+      "repoUrl": "https://github.com/anomalyco/opencode.git",
+      "ref": "v1.18.13@a105350812f05f914c768e468559dbd6bd508d8e",
+      "path": ".slim/clonedeps/repos/anomalyco__opencode-v1.18.13",
+      "packagePath": "packages/plugin",
+      "reason": "Core plugin lifecycle and hook API used by the orchestration plugin."
+    },
+    {
+      "name": "@opencode-ai/sdk",
+      "resolvedVersion": "1.18.13",
+      "repoUrl": "https://github.com/anomalyco/opencode.git",
+      "ref": "v1.18.13@a105350812f05f914c768e468559dbd6bd508d8e",
+      "path": ".slim/clonedeps/repos/anomalyco__opencode-v1.18.13",
+      "packagePath": "packages/sdk/js",
+      "reason": "SDK types and runtime client/session/message shapes used across agents, hooks, tools, and council code."
+    },
+    {
+      "name": "@modelcontextprotocol/sdk",
+      "resolvedVersion": "1.30.0",
+      "repoUrl": "https://github.com/modelcontextprotocol/typescript-sdk.git",
+      "ref": "1.30.0@2d889f2b329e46680ec9bdd565de4616c497825a",
+      "path": ".slim/clonedeps/repos/modelcontextprotocol__typescript-sdk",
+      "packagePath": ".",
+      "reason": "MCP protocol/server implementation details used by built-in MCP integrations."
+    },
+    {
+      "name": "anomalyco/opencode",
+      "resolvedVersion": "v2",
+      "repoUrl": "https://github.com/anomalyco/opencode.git",
+      "ref": "v2@dbd9b18f3d7b4ef3e346eafd91613896c9e3c864",
+      "path": ".slim/clonedeps/repos/opencode",
+      "packagePath": ".",
+      "reason": "OpenCode v2 TypeScript runtime source (split into packages/core, packages/server, packages/plugin, packages/sdk, packages/client) with background subagent support."
+    },
+    {
+      "name": "agentclientprotocol/agent-client-protocol",
+      "resolvedVersion": "main",
+      "repoUrl": "https://github.com/agentclientprotocol/agent-client-protocol.git",
+      "ref": "main@541daf8fa488c6b93aad4a874ac050b3daf9b282",
+      "path": ".slim/clonedeps/repos/agentclientprotocol__agent-client-protocol",
+      "packagePath": ".",
+      "reason": "Authoritative ACP specification and schema source for implementing ACP client/server compatibility."
+    }
+  ]
+}

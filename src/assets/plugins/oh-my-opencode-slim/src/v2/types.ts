@@ -1,0 +1,362 @@
+/**
+ * v2 plugin context surface.
+ *
+ * These interfaces mirror the subset of the v2 promise-plugin Context
+ * (`@opencode-ai/plugin`) this adapter consumes. They are defined locally
+ * because the v2 plugin package is not a build-time dependency (the v1 host
+ * must be able to load the main build without v2 types installed).
+ */
+
+export interface V2AgentDraft {
+  list(): Array<Record<string, unknown>>;
+  get(id: string): Record<string, unknown> | undefined;
+  default(id: string | undefined): void;
+  update(id: string, update: (agent: Record<string, unknown>) => void): void;
+  remove(id: string): void;
+}
+/** v2 Tool.Options registration flags (upstream `Tool.Options` subset).
+ * `codemode: false` is the CodeMode opt-out: upstream `Tool.snapshot()`
+ * only promotes `codemode === false` tools to direct model-visible tool
+ * definitions — everything else is reachable only inside the `execute`
+ * tool's confined JS runtime, so session tool catalogs yield
+ * `Unknown tool: <name>` even though registration succeeded. The field
+ * is additive: hosts that don't recognize the field ignore it. */
+export interface V2ToolOptions {
+  codemode?: boolean;
+  namespace?: string;
+  permission?: string;
+}
+/** v2 tool payload accepted by `tool.transform` drafts (the Tool.Info
+ * subset this adapter produces). */
+export interface V2ToolDefinition {
+  name: string;
+  description: string;
+  input: unknown;
+  options?: V2ToolOptions;
+  execute: (input: unknown, context: unknown) => Promise<unknown>;
+}
+export interface V2ToolDraft {
+  add(tool: V2ToolDefinition): void;
+}
+/** A v2 command definition passed to `command.transform` drafts. The command
+ * body runs `execute` directly (no template field). */
+export interface V2CommandDefinition {
+  name: string;
+  description?: string;
+  execute: (input: {
+    sessionID: string;
+    prompt: {
+      text: string;
+      files?: unknown[];
+      agents?: unknown[];
+      skills?: unknown[];
+    };
+    delivery?: unknown;
+  }) => Promise<void>;
+}
+/** Command transform draft. v2 command drafts are add-only;
+ * `V2CommandDraft` mirrors the `add()` shape. */
+export interface V2CommandDraft {
+  add(def: V2CommandDefinition): void;
+}
+export interface V2SessionContextEvent {
+  readonly sessionID: string;
+  readonly agent: string;
+  readonly model: Record<string, unknown>;
+  /** Mutable request options (official `SessionContext.options`): typed
+   * generation settings (e.g. `temperature`) and arbitrary provider options.
+   * The runtime-profile bridge applies captured child profiles here — it
+   * never touches `system`, `messages`, or `tools`. Optional: reduced hosts
+   * may omit the record. */
+  options?: Record<string, unknown>;
+  system: Array<{ type: 'text'; text: string }>;
+  messages: Array<{
+    id?: string;
+    role: string;
+    content: Array<Record<string, unknown>>;
+    /** Session identity on the message envelope. Live v2 hosts carry only
+     * `{id, time, text, type}` on transcript user messages; the v2 context
+     * bridge stamps these absence-gated so the bridged v1 injection gates
+     * (phase-reminder, board, nudge) keep working. */
+    sessionID?: string;
+    /** Agent that handled the message (same enrichment contract). */
+    agent?: string;
+    /** Envelope metadata: v2 spreads transcript user-message metadata
+     * (including prompt `metadata`, where the plugin's internal-initiator
+     * marker travels) onto the LLM Message envelope. Read-only signal for
+     * the chat-headers bridge — never mutated. */
+    metadata?: Record<string, unknown>;
+  }>;
+  tools: Record<string, unknown>;
+}
+/**
+ * v2 `session.prompt` hook payload: fires ONCE per admitted input (endpoint
+ * prompts AND subagent-tool child prompts; synthetic/shell/compaction
+ * inputs skip it). `messageID` is the eventual inbox User id — the v1
+ * `chat.message` dedupe key.
+ */
+export interface V2SessionPromptEvent {
+  readonly sessionID: string;
+  readonly messageID: string;
+  prompt: {
+    text: string;
+    files?: Array<Record<string, unknown>>;
+    agents?: Array<Record<string, unknown>>;
+    skills?: Array<Record<string, unknown>>;
+  };
+  metadata?: Record<string, unknown>;
+  readonly delivery?: unknown;
+}
+/**
+ * v2 `session.model.request` hook payload: fires once per provider request
+ * (primary loop, compaction, title, generate) with a MUTABLE `headers`
+ * record the host merges into the outgoing HTTP request. This is the v2
+ * equivalent of the v1 `chat.headers` hook surface (upstream
+ * `SessionModelRequest`; the host triggers it after the context hook and
+ * reads mutated headers back into the LLM request).
+ */
+export interface V2SessionModelRequestEvent {
+  readonly sessionID: string;
+  readonly agent: string;
+  readonly model: { id: string; providerID: string; variant?: string };
+  readonly kind: 'primary' | 'compaction' | 'title' | 'generate';
+  baseURL?: string;
+  headers: Record<string, string>;
+}
+/**
+ * v2 `session.compaction` hook payload: the host's session
+ * summarization request. Same request shape as the context event plus an
+ * optional host-owned `result`. The plugin bridge only strips its own
+ * tagged synthetic parts from `messages`; `system` is never rewritten
+ * (open host bug: the compaction system prompt may be absent — adding
+ * one would corrupt the request) and `result` is never set.
+ */
+export interface V2SessionCompactionEvent {
+  readonly sessionID: string;
+  readonly model: Record<string, unknown>;
+  system: V2SessionContextEvent['system'];
+  messages: V2SessionContextEvent['messages'];
+  tools: Record<string, unknown>;
+  /** Host compaction options (unread by the bridge). */
+  options?: Record<string, unknown>;
+  /** Host-owned compaction result, present on some firings — read-only. */
+  result?: unknown;
+}
+export interface V2ToolBeforeEvent {
+  readonly tool: string;
+  readonly sessionID: string;
+  readonly agent: string;
+  readonly messageID: string;
+  readonly id: string;
+  input: unknown;
+}
+export interface V2ToolAfterEvent {
+  readonly tool: string;
+  readonly sessionID: string;
+  readonly agent: string;
+  readonly messageID: string;
+  readonly id: string;
+  readonly input: unknown;
+  readonly status: 'completed' | 'error';
+  result?: unknown;
+  error?: unknown;
+}
+export interface V2Registration {
+  dispose(): Promise<void> | void;
+}
+/** v2 permission Rule (OpenCode core's `Permission.Rule`). The host
+ * evaluator matches `action`/`resource` as patterns; OpenCode-core
+ * wildcard/path/precedence semantics are in flux (PRs
+ * #48194/#46495/#46871), so rules emitted by this plugin are ALWAYS
+ * exact-match strings — never `*` or `?` wildcards. */
+export interface V2PermissionRule {
+  readonly action: string;
+  readonly resource: string;
+  readonly effect: 'allow' | 'deny' | 'ask';
+}
+/** v2 mcp transform draft (used after capability probing; RemoteConfig
+ * shape see packages/schema/src/mcp.ts — no `enabled`, it uses
+ * `disabled?: boolean`; the name is the map key, not in the config). */
+export interface V2McpDraft {
+  list(): Array<[string, Record<string, unknown>]>;
+  get(name: string): Record<string, unknown> | undefined;
+  set(name: string, config: Record<string, unknown>): void;
+  update(name: string, update: (c: Record<string, unknown>) => void): void;
+  remove(name: string): void;
+}
+export interface V2Context {
+  readonly app: { readonly name: string; readonly version: string };
+  readonly options: Record<string, unknown>;
+  /** Host location (probe before use; fall back to process.cwd()). */
+  readonly location?: {
+    directory: string;
+    workspaceID?: string;
+    project: { id: string; directory: string; canonical: string };
+  };
+  agent: {
+    transform(cb: (draft: V2AgentDraft) => void): Promise<V2Registration>;
+    /** v2 `AgentDomain.reload` — rebuilds the host agent registry. */
+    reload(): Promise<void>;
+    list(): Promise<unknown>;
+  };
+  tool: {
+    transform(cb: (draft: V2ToolDraft) => void): Promise<V2Registration>;
+    hook(
+      name: 'execute.before' | 'execute.after',
+      cb: (event: V2ToolBeforeEvent | V2ToolAfterEvent) => Promise<void>,
+    ): Promise<V2Registration>;
+  };
+  command: {
+    transform(cb: (draft: V2CommandDraft) => void): Promise<V2Registration>;
+    list(): Promise<unknown>;
+  };
+  skill?: {
+    transform(
+      cb: (draft: {
+        add(skill: unknown): void;
+        update(
+          id: string,
+          update: (skill: Record<string, unknown>) => void,
+        ): void;
+        remove(id: string): void;
+      }) => void,
+    ): Promise<V2Registration>;
+  };
+  session: {
+    hook(
+      name: 'context',
+      cb: (event: V2SessionContextEvent) => Promise<void>,
+    ): Promise<V2Registration>;
+    /** v2 session.prompt hook — once per admitted input (see
+     * V2SessionPromptEvent). Older v2 hosts reject the name; callers must
+     * keep a fallback path. */
+    hook(
+      name: 'prompt',
+      cb: (event: V2SessionPromptEvent) => Promise<void>,
+    ): Promise<V2Registration>;
+    /** v2 session.model.request hook — per provider request with mutable
+     * `headers` (see V2SessionModelRequestEvent; the v1 `chat.headers`
+     * equivalent). Older v2 hosts reject the name; callers must degrade. */
+    hook(
+      name: 'model.request',
+      cb: (event: V2SessionModelRequestEvent) => Promise<void>,
+    ): Promise<V2Registration>;
+    /** v2 session.compaction hook — host summarization request
+     * (see V2SessionCompactionEvent). */
+    hook(
+      name: 'compaction',
+      cb: (event: V2SessionCompactionEvent) => Promise<void>,
+    ): Promise<V2Registration>;
+    /** v2 session.get — SessionInfo by id (runtime-probed). */
+    get?(input: { sessionID: string }): Promise<unknown>;
+    /** Wait for the session agent loop to become idle (runtime-probed). */
+    wait?(input: { sessionID: string }): Promise<void>;
+    /** v2 session.remove — DELETE /api/session/:id (runtime-probed). */
+    remove?(input: { sessionID: string }): Promise<unknown>;
+    /** v2 session.list — query-filtered listing (runtime-probed).
+     * `parentID` accepts a session id or `null`/the literal `"null"`
+     * string for root-only listing. */
+    list?(input: {
+      directory?: string;
+      parentID?: string | null;
+    }): Promise<unknown>;
+    /** v2 session.interrupt — `resume: false` aborts the active run. */
+    interrupt?(input: {
+      sessionID: string;
+      resume?: boolean;
+    }): Promise<unknown>;
+    /** v2 session.update ({sessionID, title?, permissions?}) — sets the
+     * session title and/or REPLACES the session-scoped rule list (see
+     * createPermissionRulesBridge in setup.ts). */
+    update?(input: {
+      sessionID: string;
+      title?: string;
+      permissions?: V2PermissionRule[];
+    }): Promise<unknown>;
+    /** v2 session.switchModel — v2 prompts carry no model, so a model
+     * change must precede the prompt (runtime-probed). */
+    switchModel?(input: {
+      sessionID: string;
+      model: { id: string; providerID: string; variant?: string };
+    }): Promise<unknown>;
+    /** v2 session.context — full transcript; replaces v1 session.messages. */
+    context?(input: {
+      sessionID: string;
+    }): Promise<Array<Record<string, unknown>>>;
+    /** v2 session.messages — paginated projected messages (runtime-probed).
+     * `order: 'desc'` + `limit` yields the LAST N items newest-first;
+     * callers reverse for the v1 ascending shape. */
+    messages?(input: {
+      sessionID: string;
+      limit?: number;
+      order?: 'asc' | 'desc';
+      cursor?: string;
+    }): Promise<unknown>;
+    /** v2 session.prompt subset used here; resume:false admits without waking. */
+    prompt?(input: {
+      sessionID: string;
+      id?: string;
+      text: string;
+      files?: Array<{ uri: string; name?: string }>;
+      metadata?: Record<string, unknown>;
+      delivery?: 'steer' | 'queue';
+      resume?: boolean;
+    }): Promise<unknown>;
+    /** v2 session.synthetic — like prompt but not persisted as user
+     * input. `delivery` routes the inbox entry ("steer" | "queue");
+     * `resume: false` admits the input WITHOUT waking the session. */
+    synthetic?(input: {
+      sessionID: string;
+      id?: string;
+      text: string;
+      description?: string;
+      metadata?: Record<string, unknown>;
+      delivery?: 'steer' | 'queue';
+      resume?: boolean;
+    }): Promise<unknown>;
+    /** v2 session.switchAgent ({sessionID, agent}). */
+    switchAgent?(input: Record<string, unknown>): Promise<unknown>;
+  };
+  event: {
+    subscribe(): AsyncIterable<Record<string, unknown>>;
+  };
+  permission?: {
+    reply(input: {
+      sessionID: string;
+      requestID: string;
+      decision: 'once' | 'always' | 'reject';
+      message?: string;
+    }): Promise<unknown>;
+  };
+  /** v2 storage domain (runtime-probed optional, like session.list —
+   * hosts without it keep plugin state process-local). Mirrors the
+   * upstream StorageDomain subset: `scan` is cursor-paginated via the
+   * optional `next` field. Values are JSON. */
+  readonly storage?: {
+    get(key: string): Promise<unknown>;
+    set(key: string, value: unknown): Promise<void>;
+    remove(key: string): Promise<void>;
+    scan(options: { prefix: string; after?: string; limit?: number }): Promise<{
+      entries: Array<{ key: string; value: unknown }>;
+      next?: string;
+    }>;
+  };
+  /** v2 mcp domain (present on hosts ≥ #45408; probe before use). */
+  mcp?: {
+    transform(cb: (draft: V2McpDraft) => void): Promise<V2Registration>;
+    reload(): Promise<void>;
+  };
+}
+
+/** The v2 session domain (context hook + runtime-probed methods), declared
+ * once so adapters share the exact shape. */
+export type V2Session = V2Context['session'];
+
+export type V2Cleanup = () => Promise<void> | void;
+
+/** Parsed v2 Model.Ref derived from a v1 "provider/model" string. */
+export interface ModelRef {
+  providerID: string;
+  id: string;
+  variant?: string;
+}

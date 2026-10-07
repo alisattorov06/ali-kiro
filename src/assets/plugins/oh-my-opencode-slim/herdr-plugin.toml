@@ -1,0 +1,7 @@
+id = "oh-my-opencode-slim"
+name = "oh-my-opencode-slim"
+version = "2.2.14"
+description = "OpenCode agent orchestration plugin with a Herdr multiplexer adapter"
+repository = "https://github.com/alvinunreal/oh-my-opencode-slim"
+min_herdr_version = "0.8.0"
+platforms = ["linux", "macos", "windows"]

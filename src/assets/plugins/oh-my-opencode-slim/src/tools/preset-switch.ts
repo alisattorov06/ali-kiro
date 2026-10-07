@@ -1,0 +1,1058 @@
+import * as fs from 'node:fs';
+import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import {
+  mutateJsonFile,
+  removeTopLevelJsonProperty,
+  stripJsonComments,
+} from '../cli/config-io';
+import type {
+  AgentOverrideConfig,
+  PluginConfig,
+  Preset,
+  PresetDefinition,
+  PresetInput,
+  RawPluginConfig,
+} from '../config';
+import { normalizePreset, PresetResolutionError } from '../config';
+import { AGENT_ALIASES } from '../config/constants';
+import {
+  findPluginConfigPaths,
+  isProjectConfigDisabled,
+  loadRawPluginConfigFromPath,
+  mergePluginConfigs,
+} from '../config/loader';
+import { mergePresetMaps, resolvePresetDefinition } from '../config/presets';
+import {
+  isPrototypeSensitiveName,
+  ownPresetValue,
+  withAgentOverride,
+  withoutAgentOverride,
+} from '../preset-editor-domain';
+
+export type PresetMap = Record<string, PresetInput>;
+
+function interpolateConfigEnvironment(raw: string): string {
+  return raw.replace(
+    /\{env:([^}]+)\}/g,
+    (_, variableName) => process.env[variableName] ?? '',
+  );
+}
+
+/** Own-property-only write; a `__proto__` key can never touch the prototype. */
+function setOwn(
+  record: Record<string, PresetInput>,
+  name: string,
+  value: PresetInput,
+): void {
+  Object.defineProperty(record, name, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+/**
+ * Result of a preset switch attempt. `message` is user-facing and intended for
+ * a TUI toast/dialog (it is never injected into the LLM context).
+ */
+export interface PresetSwitchResult {
+  ok: boolean;
+  presetName: string;
+  message: string;
+  /** Per-agent summary lines, e.g. "orchestrator → model: x, variant: y". */
+  summary: string[];
+}
+
+export type PresetSwitchScope = 'user' | 'effective' | 'project' | 'global';
+
+export interface PresetSwitchOptions {
+  hostFlavor?: string;
+  /**
+   * "user" preserves historical /preset behavior: write the user config and
+   * refuse when a project-local override would mask the result.
+   *
+   * "effective" preserves the original Companion behavior: update an existing
+   * project override, otherwise fall back to the user config.
+   *
+   * "project" always writes the project layer, creating the canonical
+   * .opencode config when necessary.
+   *
+   * "global" explicitly writes the user/global layer even when this project
+   * has a local override. Callers should make that scope visible to the user.
+   */
+  scope?: PresetSwitchScope;
+}
+
+export interface PresetSelectionState {
+  effective?: string;
+  project?: string;
+  global?: string;
+  projectAvailable: string[];
+  globalAvailable: string[];
+}
+
+type PersistPresetResult = { ok: true } | { ok: false; message: string };
+
+/** A flattened, SDK-shaped agent override derived from a preset entry. */
+export interface AgentUpdate {
+  model?: string;
+  inheritModelFrom?: string;
+  temperature?: number;
+  variant?: string;
+  options?: Record<string, unknown>;
+  skills?: string[];
+  skills_add?: string[];
+  skills_remove?: string[];
+  skills_include_local?: boolean;
+  mcps?: string[];
+  prompt?: string;
+  orchestratorPrompt?: string;
+  displayName?: string;
+  description?: string;
+  color?: string;
+  permission?: unknown;
+}
+
+/**
+ * Determine whether a preset defines at least one non-empty agent override.
+ * Non-model fields (inheritModelFrom, skills, mcps, prompts, permissions, etc.)
+ * make an override valid.
+ */
+export function hasPresetOverrides(preset: Preset): boolean {
+  for (const override of Object.values(preset)) {
+    if (override && typeof override === 'object' && !Array.isArray(override)) {
+      if (Object.keys(override).length > 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Switch the active preset purely through on-disk state: persist the preset
+ * name to the user config file. The sidebar snapshot is deliberately NOT
+ * touched — the new preset applies on the next reload/restart, when
+ * `loadPluginConfig` re-reads the config file and merges the preset into
+ * `config.agents`. Refreshing the sidebar mid-session while the agent
+ * registry is unchanged would show models that don't match the running
+ * agents, which is confusing.
+ *
+ * This is the shared core used by the TUI `/preset` slash command. It
+ * deliberately does NOT touch OpenCode's in-memory agent registry. It also
+ * does not set the server-side runtime-preset singleton, because the TUI
+ * runs in a separate process from the server and cannot reach that state.
+ */
+export function switchPresetOnDisk(
+  directory: string,
+  presetName: string,
+  config: PluginConfig,
+  options: PresetSwitchOptions = {},
+): PresetSwitchResult {
+  const scope = options.scope ?? 'user';
+  if (scope === 'project' && isProjectConfigDisabled()) {
+    return {
+      ok: false,
+      presetName,
+      message:
+        'Cannot save a project preset: OPENCODE_DISABLE_PROJECT_CONFIG disables project configuration. Unset it or use Global scope.',
+      summary: [],
+    };
+  }
+  const configuredPresets =
+    scope === 'global'
+      ? readUserPresets(directory)
+      : getAllConfiguredPresets(directory, options.hostFlavor);
+  const presets: PresetMap =
+    scope === 'global'
+      ? { ...configuredPresets }
+      : {
+          ...configuredPresets,
+          ...((config.presets ?? {}) as PresetMap),
+        };
+  const rawPreset = ownPresetValue(presets, presetName);
+
+  if (!rawPreset) {
+    const available = Object.keys(presets);
+    const hint =
+      available.length > 0
+        ? `Available presets: ${available.join(', ')}`
+        : 'No presets configured. Define presets in oh-my-opencode-slim.jsonc.';
+    return {
+      ok: false,
+      presetName,
+      message: `Preset "${presetName}" not found. ${hint}`,
+      summary: [],
+    };
+  }
+
+  let effectivePreset: Preset;
+  let hasMarketplaceActivation = false;
+  try {
+    const definition = resolvePresetDefinition(presetName, presets);
+    effectivePreset = definition.agents;
+    hasMarketplaceActivation = definition.marketplace !== undefined;
+  } catch (error) {
+    return {
+      ok: false,
+      presetName,
+      message:
+        error instanceof PresetResolutionError
+          ? `Preset "${presetName}" cannot be applied: ${error.message}.`
+          : `Preset "${presetName}" inheritance resolution failed: ${String(error)}.`,
+      summary: [],
+    };
+  }
+
+  if (!hasPresetOverrides(effectivePreset) && !hasMarketplaceActivation) {
+    return {
+      ok: false,
+      presetName,
+      message: `Preset "${presetName}" is empty (no agent overrides defined).`,
+      summary: [],
+    };
+  }
+
+  const projectConfig = readProjectConfig(directory, options.hostFlavor);
+  const projectPreset =
+    typeof projectConfig?.preset === 'string'
+      ? projectConfig.preset.trim()
+      : undefined;
+
+  if (scope === 'user' && projectPreset && projectPreset !== presetName) {
+    return {
+      ok: false,
+      presetName,
+      message: `Cannot switch to preset "${presetName}": project config (.opencode) explicitly sets preset "${projectPreset}", which takes precedence on reload. Remove or update the preset in .opencode/oh-my-opencode-slim.jsonc first.`,
+      summary: [],
+    };
+  }
+
+  const envPreset = process.env.OH_MY_OPENCODE_SLIM_PRESET;
+  if (envPreset && envPreset !== presetName) {
+    return {
+      ok: false,
+      presetName,
+      message: `Cannot switch to preset "${presetName}": OH_MY_OPENCODE_SLIM_PRESET is set to "${envPreset}", which takes precedence on reload. Unset the environment variable or set it to "${presetName}" first.`,
+      summary: [],
+    };
+  }
+
+  const agentUpdates = buildAgentUpdates(effectivePreset);
+  const persistence =
+    scope === 'project'
+      ? persistProjectPresetName(directory, presetName)
+      : scope === 'global'
+        ? persistPresetName(directory, presetName)
+        : scope === 'effective' && projectPreset
+          ? persistProjectPresetName(directory, presetName)
+          : persistPresetName(directory, presetName);
+  if (!persistence.ok) {
+    return {
+      ok: false,
+      presetName,
+      message: `Could not save preset "${presetName}": ${persistence.message}`,
+      summary: [],
+    };
+  }
+
+  return {
+    ok: true,
+    presetName,
+    message: `Saved${scope === 'project' ? ' project' : scope === 'global' ? ' global' : ''} preset "${presetName}". Reload OpenCode for it to take effect. The current session keeps its existing agent models to avoid truncating context, drifting prior turns, or destabilizing running subagents.`,
+    summary: buildPresetSummary(agentUpdates),
+  };
+}
+
+export function getPresetSelectionState(
+  directory: string,
+  hostFlavor?: string,
+): PresetSelectionState {
+  const userConfig = readUserConfig(directory);
+  const projectConfig = readProjectConfig(directory, hostFlavor);
+  const globalPreset =
+    typeof userConfig?.preset === 'string' &&
+    interpolateConfigEnvironment(userConfig.preset).trim()
+      ? interpolateConfigEnvironment(userConfig.preset).trim()
+      : undefined;
+  const projectPreset =
+    typeof projectConfig?.preset === 'string' && projectConfig.preset.trim()
+      ? projectConfig.preset.trim()
+      : undefined;
+  const envPreset = process.env.OH_MY_OPENCODE_SLIM_PRESET?.trim() || undefined;
+
+  return {
+    effective: envPreset ?? projectPreset ?? globalPreset,
+    project: projectPreset,
+    global: globalPreset,
+    projectAvailable: Object.keys(
+      getAllConfiguredPresets(directory, hostFlavor),
+    ).sort((a, b) => a.localeCompare(b)),
+    globalAvailable: Object.keys(readUserPresets(directory)).sort((a, b) =>
+      a.localeCompare(b),
+    ),
+  };
+}
+
+export function clearProjectPresetOnDisk(
+  directory: string,
+  hostFlavor?: string,
+): PresetSwitchResult {
+  if (isProjectConfigDisabled()) {
+    return {
+      ok: false,
+      presetName: '',
+      message:
+        'Cannot change project preset inheritance: OPENCODE_DISABLE_PROJECT_CONFIG disables project configuration. Unset it or use Global scope.',
+      summary: [],
+    };
+  }
+  let projectConfigPath: string | null;
+  try {
+    projectConfigPath = findPluginConfigPaths(
+      directory,
+      hostFlavor,
+    ).projectConfigPath;
+  } catch (error) {
+    return {
+      ok: false,
+      presetName: '',
+      message: `Could not locate the project config file: ${describeError(error)}.`,
+      summary: [],
+    };
+  }
+
+  try {
+    if (projectConfigPath)
+      removeTopLevelJsonProperty(projectConfigPath, 'preset');
+  } catch (error) {
+    return {
+      ok: false,
+      presetName: '',
+      message: `Could not clear the project preset override: ${describeError(error)}.`,
+      summary: [],
+    };
+  }
+
+  const selection = getPresetSelectionState(directory, hostFlavor);
+  const source = process.env.OH_MY_OPENCODE_SLIM_PRESET?.trim()
+    ? 'OH_MY_OPENCODE_SLIM_PRESET'
+    : selection.project
+      ? 'an ancestor project configuration'
+      : 'the global configuration';
+  const inheritance = selection.effective
+    ? `This project now inherits preset "${selection.effective}" from ${source}.`
+    : 'No inherited preset is selected.';
+  return {
+    ok: true,
+    presetName: selection.effective ?? '',
+    message: `${projectConfigPath ? 'Local project preset override cleared.' : 'No local project preset override exists.'} ${inheritance}`,
+    summary: [],
+  };
+}
+
+/**
+ * Build the SDK-shaped agent overrides from a preset, resolving legacy alias
+ * keys (e.g. "explore" → "explorer").
+ */
+export function buildAgentUpdates(preset: Preset): Record<string, AgentUpdate> {
+  const agentUpdates: Record<string, AgentUpdate> = {};
+  for (const [agentName, override] of Object.entries(preset)) {
+    if (!override || typeof override !== 'object' || Array.isArray(override)) {
+      continue;
+    }
+    const resolvedName = AGENT_ALIASES[agentName] ?? agentName;
+    const agentConfig = mapOverrideToAgentConfig(override);
+    if (Object.keys(agentConfig).length > 0) {
+      agentUpdates[resolvedName] = agentConfig;
+    }
+  }
+  return agentUpdates;
+}
+
+/**
+ * Map an AgentOverrideConfig (from plugin config) to the subset of agent
+ * config fields shown in the saved preset summary.
+ */
+export function mapOverrideToAgentConfig(
+  override: AgentOverrideConfig,
+): AgentUpdate {
+  const agentConfig: AgentUpdate = {};
+
+  if (typeof override.model === 'string') {
+    agentConfig.model = override.model;
+  } else if (Array.isArray(override.model) && override.model.length > 0) {
+    // Array-form model (fallback chain): pick the first entry. Full chain
+    // resolution happens at init time via the config() hook, so at runtime we
+    // use the primary model from the array.
+    const first = override.model[0];
+    agentConfig.model = typeof first === 'string' ? first : first.id;
+    if (typeof first !== 'string' && first.variant) {
+      agentConfig.variant = first.variant;
+    }
+  }
+
+  if (typeof override.inheritModelFrom === 'string') {
+    agentConfig.inheritModelFrom = override.inheritModelFrom;
+  }
+
+  if (typeof override.temperature === 'number') {
+    agentConfig.temperature = override.temperature;
+  }
+
+  if (typeof override.variant === 'string') {
+    agentConfig.variant = override.variant;
+  }
+
+  if (
+    override.options &&
+    typeof override.options === 'object' &&
+    !Array.isArray(override.options)
+  ) {
+    agentConfig.options = override.options;
+  }
+
+  if (Array.isArray(override.skills) && override.skills.length > 0) {
+    agentConfig.skills = override.skills;
+  }
+
+  if (Array.isArray(override.skills_add) && override.skills_add.length > 0) {
+    agentConfig.skills_add = override.skills_add;
+  }
+
+  if (
+    Array.isArray(override.skills_remove) &&
+    override.skills_remove.length > 0
+  ) {
+    agentConfig.skills_remove = override.skills_remove;
+  }
+
+  if (typeof override.skills_include_local === 'boolean') {
+    agentConfig.skills_include_local = override.skills_include_local;
+  }
+
+  if (Array.isArray(override.mcps) && override.mcps.length > 0) {
+    agentConfig.mcps = override.mcps;
+  }
+
+  if (typeof override.prompt === 'string') {
+    agentConfig.prompt = override.prompt;
+  }
+
+  if (typeof override.orchestratorPrompt === 'string') {
+    agentConfig.orchestratorPrompt = override.orchestratorPrompt;
+  }
+
+  if (typeof override.displayName === 'string') {
+    agentConfig.displayName = override.displayName;
+  }
+
+  if (typeof override.description === 'string') {
+    agentConfig.description = override.description;
+  }
+
+  if (typeof override.color === 'string') {
+    agentConfig.color = override.color;
+  }
+
+  if (override.permission !== undefined) {
+    agentConfig.permission = override.permission;
+  }
+
+  return agentConfig;
+}
+
+/** Build the per-agent summary lines for a switch result / picker tooltip. */
+export function buildPresetSummary(
+  agentUpdates: Record<string, AgentUpdate>,
+): string[] {
+  const summaryParts: string[] = [];
+  for (const [name, cfg] of Object.entries(agentUpdates)) {
+    const parts: string[] = [name];
+    if (cfg.model) parts.push(`model: ${cfg.model}`);
+    if (cfg.inheritModelFrom) parts.push(`inherit: ${cfg.inheritModelFrom}`);
+    if (cfg.variant) parts.push(`variant: ${cfg.variant}`);
+    if (cfg.temperature !== undefined) parts.push(`temp: ${cfg.temperature}`);
+    if (cfg.options) parts.push('options: yes');
+    if (cfg.skills && cfg.skills.length > 0) {
+      parts.push(`skills: ${cfg.skills.join(',')}`);
+    }
+    if (cfg.skills_add && cfg.skills_add.length > 0) {
+      parts.push(`skills_add: ${cfg.skills_add.join(',')}`);
+    }
+    if (cfg.skills_remove && cfg.skills_remove.length > 0) {
+      parts.push(`skills_remove: ${cfg.skills_remove.join(',')}`);
+    }
+    if (cfg.skills_include_local !== undefined) {
+      parts.push(`skills_include_local: ${cfg.skills_include_local}`);
+    }
+    if (cfg.mcps && cfg.mcps.length > 0) {
+      parts.push(`mcps: ${cfg.mcps.join(',')}`);
+    }
+    if (cfg.prompt) parts.push('prompt: yes');
+    if (cfg.orchestratorPrompt) parts.push('orchestratorPrompt: yes');
+    if (cfg.displayName) parts.push(`displayName: ${cfg.displayName}`);
+    if (cfg.description) parts.push('description: yes');
+    if (cfg.color) parts.push(`color: ${cfg.color}`);
+    if (cfg.permission !== undefined) parts.push('permissions: yes');
+    if (parts.length > 1) {
+      summaryParts.push(parts.join(' → '));
+    }
+  }
+  return summaryParts;
+}
+
+/**
+ * Persist the preset name to the user-level config file so it survives
+ * restarts. A failure is returned so callers do not report a switch that will
+ * not survive the next reload.
+ *
+ * Note: this rewrites the file as plain JSON (JSONC comments are not
+ * preserved), matching the prior server-side behavior.
+ */
+function persistPresetName(
+  directory: string,
+  presetName: string,
+): PersistPresetResult {
+  let userConfigPath: string | null;
+  try {
+    userConfigPath = findPluginConfigPaths(directory).userConfigPath;
+  } catch (error) {
+    return {
+      ok: false,
+      message: `Could not locate the user config file: ${describeError(error)}.`,
+    };
+  }
+
+  if (!userConfigPath) {
+    return {
+      ok: false,
+      message:
+        'No user config file was found. Create oh-my-opencode-slim.jsonc or .json before switching presets.',
+    };
+  }
+
+  try {
+    mutateJsonFile(userConfigPath, (current) => ({
+      ...current,
+      preset: presetName,
+    }));
+  } catch (error) {
+    const message = describeError(error);
+    const isReadError =
+      message.includes('Config file must contain') ||
+      message.toLowerCase().includes('parse') ||
+      message.toLowerCase().includes('json');
+    return {
+      ok: false,
+      message: isReadError
+        ? `Could not read or parse the user config file: ${message}.`
+        : `Could not write the user config file: ${message}.`,
+    };
+  }
+
+  return { ok: true };
+}
+
+function persistProjectPresetName(
+  directory: string,
+  presetName: string,
+): PersistPresetResult {
+  let projectConfigPath: string;
+  try {
+    const existing = findPluginConfigPaths(directory).projectConfigPath;
+    projectConfigPath =
+      existing ?? join(directory, '.opencode', 'oh-my-opencode-slim.jsonc');
+  } catch (error) {
+    return {
+      ok: false,
+      message: `Could not locate the project config file: ${describeError(error)}.`,
+    };
+  }
+
+  try {
+    mutateJsonFile(projectConfigPath, (current) => ({
+      ...current,
+      preset: presetName,
+    }));
+  } catch (error) {
+    const message = describeError(error);
+    const isReadError =
+      message.includes('Config file must contain') ||
+      message.toLowerCase().includes('parse') ||
+      message.toLowerCase().includes('json');
+    return {
+      ok: false,
+      message: isReadError
+        ? `Could not read or parse the project config file: ${message}.`
+        : `Could not write the project config file: ${message}.`,
+    };
+  }
+
+  return { ok: true };
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Read the user-level config file as a parsed object. Returns null if the
+ * file is absent or unreadable.
+ */
+export function readUserConfig(
+  directory: string,
+): Record<string, unknown> | null {
+  try {
+    const { userConfigPath } = findPluginConfigPaths(directory);
+    if (!userConfigPath) return null;
+    // Strip a UTF-8 BOM (RFC 8259 permits one); JSON.parse would otherwise
+    // fail with "Unrecognized token" and the preset name would be lost.
+    const raw = fs.readFileSync(userConfigPath, 'utf-8').replace(/^\uFEFF/, '');
+    return JSON.parse(stripJsonComments(raw)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read raw presets from the editable user config file.
+ */
+export function readUserPresets(
+  directory: string,
+): Record<string, PresetInput> {
+  const config = readUserConfig(directory);
+  if (
+    !config ||
+    typeof config.presets !== 'object' ||
+    config.presets === null ||
+    Array.isArray(config.presets)
+  ) {
+    return {};
+  }
+  return config.presets as Record<string, PresetInput>;
+}
+
+/**
+ * Read and merge ancestor project config files. Returns null if absent.
+ */
+export function readProjectConfig(
+  directory: string,
+  hostFlavor?: string,
+): Record<string, unknown> | null {
+  const { projectConfigPaths } = findPluginConfigPaths(directory, hostFlavor);
+  let config: RawPluginConfig | undefined;
+  for (const configPath of projectConfigPaths) {
+    const layer = loadRawPluginConfigFromPath(configPath, { silent: true });
+    if (layer) {
+      config = mergePluginConfigs(config ?? {}, layer);
+    }
+  }
+  return config ?? null;
+}
+
+/**
+ * Retrieve all raw presets configured across user and project config files.
+ * Own-property-only reads and writes keep pre-existing prototype-sensitive
+ * names (`__proto__`, `constructor`) from resolving through the prototype.
+ */
+export function getAllConfiguredPresets(
+  directory: string,
+  hostFlavor?: string,
+): Record<string, PresetInput> {
+  const userPresets = readUserPresets(directory);
+  const projectConfig = readProjectConfig(directory, hostFlavor);
+  const projectPresets =
+    projectConfig &&
+    typeof projectConfig.presets === 'object' &&
+    projectConfig.presets !== null &&
+    !Array.isArray(projectConfig.presets)
+      ? (projectConfig.presets as Record<string, PresetInput>)
+      : {};
+  const merged = mergePresetMaps(userPresets, projectPresets) ?? {};
+  const safe: Record<string, PresetInput> = {};
+  for (const name of Object.keys(merged)) {
+    const value = ownPresetValue(merged, name);
+    if (value !== undefined) setOwn(safe, name, value);
+  }
+  return safe;
+}
+
+export type PresetSource = 'project' | 'user' | 'none';
+
+/**
+ * Determine the configuration source of a preset.
+ * Returns 'project' if the preset is defined in project config (.opencode),
+ * 'user' if defined in user config, or 'none' if not found.
+ */
+export function getPresetSource(
+  directory: string,
+  name: string,
+  hostFlavor?: string,
+): PresetSource {
+  const projectConfig = readProjectConfig(directory, hostFlavor);
+  if (
+    projectConfig &&
+    typeof projectConfig.presets === 'object' &&
+    projectConfig.presets !== null &&
+    !Array.isArray(projectConfig.presets) &&
+    Object.hasOwn(projectConfig.presets, name)
+  ) {
+    return 'project';
+  }
+  const userPresets = readUserPresets(directory);
+  if (Object.hasOwn(userPresets, name)) {
+    return 'user';
+  }
+  return 'none';
+}
+
+/**
+ * Get the editable local definition of a preset (only local agents and local `extends`).
+ * Does NOT materialize inherited effective agents.
+ */
+export function getEditablePreset(
+  directory: string,
+  name: string,
+  hostFlavor?: string,
+): PresetDefinition {
+  const userPresets = readUserPresets(directory);
+  const raw = ownPresetValue(userPresets, name);
+  if (raw !== undefined) {
+    return normalizePreset(raw);
+  }
+  const projectConfig = readProjectConfig(directory, hostFlavor);
+  const projectPresets =
+    projectConfig &&
+    typeof projectConfig.presets === 'object' &&
+    projectConfig.presets !== null &&
+    !Array.isArray(projectConfig.presets)
+      ? (projectConfig.presets as Record<string, PresetInput>)
+      : {};
+  const projectRaw = ownPresetValue(projectPresets, name);
+  if (projectRaw !== undefined) {
+    return normalizePreset(projectRaw);
+  }
+  return { agents: {} };
+}
+
+/**
+ * Find all preset names in `presets` that directly extend `baseName`.
+ */
+export function findPresetDependents(
+  baseName: string,
+  presets: Record<string, PresetInput>,
+): string[] {
+  const dependents: string[] = [];
+  for (const [name, definition] of Object.entries(presets)) {
+    if (name === baseName || !definition) continue;
+    try {
+      const normalized = normalizePreset(definition);
+      if (normalized.extends === baseName) {
+        dependents.push(name);
+      }
+    } catch {
+      // Ignore malformed entries
+    }
+  }
+  return dependents;
+}
+
+/**
+ * Check if setting `targetParent` as the parent of `childName` would create a cycle.
+ */
+export function wouldCreatePresetCycle(
+  childName: string,
+  targetParent: string,
+  presets: Record<string, PresetInput>,
+): boolean {
+  if (childName === targetParent) {
+    return true;
+  }
+
+  const visited = new Set<string>();
+  let current: string | undefined = targetParent;
+
+  while (current) {
+    if (current === childName) {
+      return true;
+    }
+    if (visited.has(current)) {
+      // Existing cycle in targetParent's ancestry
+      return true;
+    }
+    visited.add(current);
+
+    const definition = ownPresetValue(presets, current);
+    if (!definition) {
+      break;
+    }
+    try {
+      const normalized = normalizePreset(definition);
+      current = normalized.extends;
+    } catch {
+      break;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Persist a preset (create or overwrite) into the user config's `presets`
+ * object. Supports both flat agent maps and structured preset definitions with `extends`.
+ * Preserves local `extends` and local agents only without materializing inherited agents.
+ * Returns true on success.
+ */
+export function writePreset(
+  directory: string,
+  name: string,
+  preset: Preset | PresetDefinition,
+  options: { mergeChangesFrom?: PresetDefinition } = {},
+): boolean {
+  if (isPrototypeSensitiveName(name) || name.startsWith('__omo_')) {
+    // New names are validated by the editors before they get here; this is
+    // defense-in-depth for direct callers.
+    return false;
+  }
+  try {
+    const { userConfigPath } = findPluginConfigPaths(directory);
+    if (!userConfigPath) return false;
+    mutateJsonFile(userConfigPath, (config) => {
+      const presets = isRecord(config.presets) ? config.presets : {};
+      const normalized = normalizePreset(preset);
+      if (options.mergeChangesFrom && !isRecord(presets[name])) {
+        throw new Error(`Preset "${name}" was deleted while being edited`);
+      }
+      if (options.mergeChangesFrom) {
+        const current = normalizePreset(presets[name] as PresetInput);
+        const base = options.mergeChangesFrom;
+        const editorChangedExtends = normalized.extends !== base.extends;
+        const diskChangedExtends = current.extends !== base.extends;
+        if (
+          editorChangedExtends &&
+          diskChangedExtends &&
+          normalized.extends !== current.extends
+        ) {
+          throw new Error(`Preset "${name}" inheritance changed concurrently`);
+        }
+        if (!editorChangedExtends) {
+          normalized.extends = current.extends;
+        }
+        const agents = { ...current.agents };
+        const agentNames = new Set([
+          ...Object.keys(base.agents),
+          ...Object.keys(normalized.agents),
+        ]);
+        for (const agentName of agentNames) {
+          const wasPresent = Object.hasOwn(base.agents, agentName);
+          const isPresent = Object.hasOwn(normalized.agents, agentName);
+          const isPresentOnDisk = Object.hasOwn(current.agents, agentName);
+          const changedByEditor =
+            wasPresent !== isPresent ||
+            (wasPresent &&
+              isPresent &&
+              !isDeepStrictEqual(
+                base.agents[agentName],
+                normalized.agents[agentName],
+              ));
+          const changedOnDisk =
+            wasPresent !== isPresentOnDisk ||
+            (wasPresent &&
+              isPresentOnDisk &&
+              !isDeepStrictEqual(
+                base.agents[agentName],
+                current.agents[agentName],
+              ));
+
+          if (!changedByEditor) continue;
+          if (!wasPresent) {
+            if (
+              isPresentOnDisk &&
+              !isDeepStrictEqual(
+                normalized.agents[agentName],
+                current.agents[agentName],
+              )
+            ) {
+              throw new Error(
+                `Preset "${name}" agent "${agentName}" was added concurrently`,
+              );
+            }
+            if (isPresent) agents[agentName] = normalized.agents[agentName];
+            continue;
+          }
+
+          if (!isPresent || !isPresentOnDisk) {
+            if (changedOnDisk && isPresent !== isPresentOnDisk) {
+              throw new Error(
+                `Preset "${name}" agent "${agentName}" changed concurrently`,
+              );
+            }
+            if (isPresent) {
+              agents[agentName] = normalized.agents[agentName];
+            } else {
+              delete agents[agentName];
+            }
+            continue;
+          }
+
+          const baseOverride = base.agents[agentName] as Record<
+            string,
+            unknown
+          >;
+          const editorOverride = normalized.agents[agentName] as Record<
+            string,
+            unknown
+          >;
+          const diskOverride = current.agents[agentName] as Record<
+            string,
+            unknown
+          >;
+          const mergedOverride = { ...diskOverride };
+          const fields = new Set([
+            ...Object.keys(baseOverride),
+            ...Object.keys(editorOverride),
+          ]);
+          for (const field of fields) {
+            const wasSet = Object.hasOwn(baseOverride, field);
+            const isSetByEditor = Object.hasOwn(editorOverride, field);
+            const isSetOnDisk = Object.hasOwn(diskOverride, field);
+            const editorChanged =
+              wasSet !== isSetByEditor ||
+              (wasSet &&
+                isSetByEditor &&
+                !isDeepStrictEqual(baseOverride[field], editorOverride[field]));
+            if (!editorChanged) continue;
+
+            const diskChanged =
+              wasSet !== isSetOnDisk ||
+              (wasSet &&
+                isSetOnDisk &&
+                !isDeepStrictEqual(baseOverride[field], diskOverride[field]));
+            if (
+              diskChanged &&
+              (isSetByEditor !== isSetOnDisk ||
+                (isSetByEditor &&
+                  !isDeepStrictEqual(
+                    editorOverride[field],
+                    diskOverride[field],
+                  )))
+            ) {
+              throw new Error(
+                `Preset "${name}" agent "${agentName}" field "${field}" changed concurrently`,
+              );
+            }
+
+            if (isSetByEditor) {
+              mergedOverride[field] = editorOverride[field];
+            } else {
+              delete mergedOverride[field];
+            }
+          }
+          agents[agentName] = mergedOverride as AgentOverrideConfig;
+        }
+        normalized.agents = agents;
+        // Marketplace activation may have changed while the editor was open.
+        // Its serialized on-disk value is authoritative for this agent edit.
+        normalized.marketplace = current.marketplace;
+      }
+      if (Object.keys(normalized.agents).length === 0) {
+        if (normalized.extends !== undefined) {
+          setOwn(presets as PresetMap, name, {
+            extends: normalized.extends,
+            agents: {},
+            ...(normalized.marketplace !== undefined
+              ? { marketplace: normalized.marketplace }
+              : {}),
+          });
+          return { ...config, presets };
+        }
+
+        // Preserve the flat representation for empty presets: `agents` can
+        // itself be a custom agent name in the flat syntax.
+        const flat: Record<string, unknown> = {};
+        if (normalized.marketplace !== undefined) {
+          flat.marketplace = normalized.marketplace;
+        }
+        setOwn(presets as PresetMap, name, flat as PresetInput);
+      } else {
+        setOwn(
+          presets as PresetMap,
+          name,
+          normalized.extends || normalized.marketplace !== undefined
+            ? normalized
+            : normalized.agents,
+        );
+      }
+      return { ...config, presets };
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Delete a preset from the user config. Returns true if removed.
+ * Returns false if the preset did not exist, if the write failed,
+ * or if other presets in the editable config depend on it.
+ */
+export function deletePreset(
+  directory: string,
+  name: string,
+  hostFlavor?: string,
+): boolean {
+  if (isPrototypeSensitiveName(name)) {
+    // Pre-existing prototype-sensitive entries stay applicable but are
+    // never mutated through the editor (own-property operations only).
+    return false;
+  }
+  try {
+    const { userConfigPath } = findPluginConfigPaths(directory);
+    if (!userConfigPath) return false;
+    let deleted = false;
+    mutateJsonFile(userConfigPath, (config) => {
+      if (!isRecord(config.presets) || !Object.hasOwn(config.presets, name)) {
+        return config;
+      }
+      const allPresets = getAllConfiguredPresets(directory, hostFlavor);
+      if (findPresetDependents(name, allPresets).length > 0) return config;
+      delete config.presets[name];
+      if (config.preset === name) delete config.preset;
+      deleted = true;
+      return config;
+    });
+    return deleted;
+  } catch {
+    return false;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Set (or replace) an agent override within an in-memory preset. Returns a
+ * new preset object; does not mutate the input.
+ */
+export function setAgentOverride(
+  preset: Preset,
+  agentName: string,
+  override: AgentOverrideConfig,
+): Preset {
+  return withAgentOverride(preset, agentName, override);
+}
+
+/**
+ * Remove an agent from an in-memory preset. Returns a new preset object; does
+ * not mutate the input. If the agent was not present, the preset is unchanged.
+ */
+export function removeAgentFromPreset(
+  preset: Preset,
+  agentName: string,
+): Preset {
+  return withoutAgentOverride(preset, agentName);
+}
