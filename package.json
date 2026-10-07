@@ -1,0 +1,38 @@
+{
+  "name": "ali-kiro",
+  "version": "1.0.0",
+  "description": "One-command installer/manager for AI coding assistants (OpenCode, Claude Code, Codex, Cursor, Aider, Gemini CLI)",
+  "type": "module",
+  "bin": {
+    "ali-kiro": "./ali-kiro.mjs"
+  },
+  "main": "./ali-kiro.mjs",
+  "exports": {
+    ".": "./ali-kiro.mjs"
+  },
+  "files": [
+    "ali-kiro.mjs",
+    "src"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test",
+    "demo": "node ali-kiro.mjs --demo"
+  },
+  "keywords": [
+    "cli",
+    "installer",
+    "manager",
+    "ai",
+    "coding-assistant",
+    "opencode",
+    "claude-code",
+    "codex",
+    "cursor",
+    "aider",
+    "gemini-cli"
+  ],
+  "license": "MIT"
+}
