@@ -1,0 +1,30 @@
+{
+  "generated": "test-fixture",
+  "servers": [
+    {
+      "name": "context7",
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "auto": true
+    },
+    {
+      "name": "bash-tool",
+      "type": "local",
+      "command": ["bash", "-c", "echo hi"],
+      "auto": true
+    },
+    {
+      "name": "manual-one",
+      "type": "remote",
+      "url": "https://example.com/mcp",
+      "auto": false,
+      "note": "needs manual approval"
+    },
+    {
+      "name": "broken",
+      "type": "remote",
+      "auto": true,
+      "note": "no url or command"
+    }
+  ]
+}

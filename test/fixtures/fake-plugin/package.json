@@ -1,0 +1,8 @@
+{
+  "name": "fake-plugin",
+  "version": "1.0.0",
+  "description": "Minimal safe plugin used by ali-kiro hermetic tests (id: x)",
+  "type": "module",
+  "main": "index.mjs",
+  "license": "MIT"
+}

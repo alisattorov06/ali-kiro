@@ -1,0 +1,8 @@
+{
+  "name": "fake-plugin",
+  "version": "1.0.0",
+  "description": "Asset-tree plugin for opencode-provider hermetic tests (id: fake)",
+  "type": "module",
+  "main": "index.mjs",
+  "license": "MIT"
+}
