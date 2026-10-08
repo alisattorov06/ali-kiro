@@ -59,7 +59,10 @@ test('run env option is merged over process.env and seen by spawn', async () => 
   assert.ok(fake.calls[0].env);
   assert.strictEqual(fake.calls[0].env.FOO, 'bar');
   assert.strictEqual(fake.calls[0].env.__ALI_KIRO_PROBE, '1');
-  assert.ok(fake.calls[0].env.PATH, 'inherits process.env');
+  assert.ok(
+    Object.keys(fake.calls[0].env).some((k) => k.toLowerCase() === 'path'),
+    'inherits process.env',
+  );
 });
 
 // ---- capture --------------------------------------------------------------

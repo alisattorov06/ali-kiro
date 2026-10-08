@@ -1,5 +1,6 @@
 // ali-kiro — verification helpers: version parsing, sha256, plugin smoke, MCP list.
 import { createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 import { run } from './executor.mjs';
@@ -77,10 +78,9 @@ export async function pluginImportSmoke(pluginDir, opts = {}) {
       error: 'TypeScript entry point — plain node cannot import .ts; opencode loads it natively, smoke skipped',
     };
   }
-  const script =
-    "import('file://'+process.argv[1]).then(m=>console.log(m.default?.id,typeof m.default?.setup)).catch(e=>{console.error(String(e));process.exit(1)})";
+  const script = "import(process.argv[1]).then(m=>console.log(m.default?.id,typeof m.default?.setup)).catch(e=>{console.error(String(e));process.exit(1)})";
   try {
-    const res = await run(process.execPath, ['-e', script, entry], {
+    const res = await run(process.execPath, ['-e', script, pathToFileURL(entry).href], {
       capture: true,
       silent: true,
       retries: 1,

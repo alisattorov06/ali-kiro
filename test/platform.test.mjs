@@ -121,7 +121,11 @@ test('configDir linux: honors XDG_CONFIG_HOME', async () => {
   );
 });
 
-test('configDir linux: falls back to ~/.config/opencode', async () => {
+test('configDir linux: falls back to ~/.config/opencode', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('HOME-based fallback is POSIX-only; os.homedir() reads USERPROFILE on Windows');
+    return;
+  }
   await withEnv({ HOME: '/home/tester', XDG_CONFIG_HOME: undefined }, () => {
     setPlatform('linux');
     try {

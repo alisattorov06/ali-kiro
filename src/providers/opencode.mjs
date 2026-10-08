@@ -80,6 +80,9 @@ export async function installPlugins(opts = {}) {
     destDirs.push({ name, dir: dest });
   }
 
+  // npm is npm.cmd on Windows; child_process.spawn without a shell fails with
+  // ENOENT on .cmd shims. bun.exe spawns fine, so only npm needs the suffix.
+  const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
   for (const { name, dir } of destDirs) {
     const hasBunLock = ['bun.lock', 'bun.lockb'].some((f) => fs.existsSync(path.join(dir, f)));
     const hasPkgLock = fs.existsSync(path.join(dir, 'package-lock.json'));
@@ -92,7 +95,7 @@ export async function installPlugins(opts = {}) {
       // bun.lock-without-bun falls back to npm; package-lock.json uses npm.
       // --legacy-peer-deps: bundled 3rd-party plugin source; peer resolution is
       // the publisher's concern, and opencode's own plugin loader installs leniently too.
-      const r = await run('npm', ['install', '--no-audit', '--no-fund', '--legacy-peer-deps'], { cwd: dir, retries: 3, timeoutMs: 300000 });
+      const r = await run(npmBin, ['install', '--no-audit', '--no-fund', '--legacy-peer-deps'], { cwd: dir, retries: 3, timeoutMs: 300000 });
       record = { name, tool: hasBunLock ? 'npm (bun.lock fallback)' : 'npm', code: r.code, ok: r.code === 0 };
       if (r.code !== 0) logger.warn(`plugin "${name}": npm install failed (code ${r.code}).`);
     } else if (hasBunLock || hasPkgLock) {
