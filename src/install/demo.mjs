@@ -17,9 +17,9 @@ export async function runDemo({ sleepMs = 120 } = {}) {
   logger.info('Assets: config 3/3 · plugins 5 · skills 38 · mcp present');
   logger.ok('Environment OK.');
 
-  logger.step(2, 'AI selection: menu (TTY) or --only/--skip filters (default: all 6)');
+  logger.step(2, 'AI selection: menu (TTY) or --only/--skip filters (default: all 7)');
   await wait();
-  logger.info('Selected 6 tools: opencode, claude-code, codex, cursor, aider, gemini');
+  logger.info('Selected 7 tools: opencode, claude-code, codex, cursor, aider, gemini, antigravity');
   logger.ok('claude-code already installed (v2.1.2) — will not reinstall.');
 
   logger.step(3, 'OpenCode full stack: config, plugins+deps+smoke, skills, MCP, service');
@@ -42,6 +42,8 @@ export async function runDemo({ sleepMs = 120 } = {}) {
   logger.ok('cursor installed (v3.23.23)');
   logger.ok('aider installed (v0.78.0)');
   logger.ok('gemini installed (v0.10.0)');
+  logger.info('antigravity install started (curl -fsSL https://antigravity.google/cli/install.sh | bash)');
+  logger.ok('antigravity installed (agy v1.3.1) — first run signs in via browser');
 
   logger.step(5, 'Verification sweep: re-check every binary version, plugins, MCP list');
   await wait();
@@ -51,6 +53,7 @@ export async function runDemo({ sleepMs = 120 } = {}) {
   logger.info('sweep: cursor → v3.23.23');
   logger.info('sweep: aider → v0.78.0');
   logger.info('sweep: gemini → v0.10.0');
+  logger.info('sweep: antigravity → v1.3.1');
   logger.info('MCP servers currently configured: context7, gh_grep, websearch');
 
   logger.step(6, 'Report + state write (~/.ali-kiro/state.json, atomic)');
@@ -69,6 +72,7 @@ export async function runDemo({ sleepMs = 120 } = {}) {
       cursor: { installed: true, version: '3.23.23', action: 'install' },
       aider: { installed: true, version: '0.78.0', action: 'install' },
       gemini: { installed: true, version: '0.10.0', action: 'install' },
+      antigravity: { installed: true, version: '1.3.1', action: 'install' },
     },
     plugins: [
       { name: 'FlowDeck', ok: true },

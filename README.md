@@ -1,10 +1,10 @@
-<!-- meta description: ali-kiro is a free, one-command cross-platform installer and manager for AI coding assistants — OpenCode, Claude Code, OpenAI Codex, Cursor, Aider, and Gemini CLI — with 38 bundled skills, 5 OpenCode plugins, and MCP server presets. Install from a single line on macOS, Linux, or Windows. -->
+<!-- meta description: ali-kiro is a free, one-command cross-platform installer and manager for AI coding assistants — OpenCode, Claude Code, OpenAI Codex, Cursor, Aider, Gemini CLI, and Antigravity CLI — with 38 bundled skills, 5 OpenCode plugins, and MCP server presets. Install from a single line on macOS, Linux, or Windows. -->
 
 # ali-kiro
 
-One-command, cross-platform installer and manager for AI coding assistants — OpenCode, Claude Code, Codex CLI, Cursor, Aider, and Gemini CLI.
+One-command, cross-platform installer and manager for AI coding assistants — OpenCode, Claude Code, Codex CLI, Cursor, Aider, Gemini CLI, and Antigravity CLI.
 
-Run one line on **macOS, Windows, or Linux** — `curl -fsSL … | bash` or `irm … | iex` — and ali-kiro downloads, installs, and verifies the six most popular AI coding tools, then configures a complete, production-grade **OpenCode stack**: merged settings, **5 plugins** (including oh-my-opencode-slim), **38 skills**, and **10 MCP server presets**. No manual setup, no permissions gymnastics.
+Run one line on **macOS, Windows, or Linux** — `curl -fsSL … | bash` or `irm … | iex` — and ali-kiro downloads, installs, and verifies the seven most popular AI coding tools, then configures a complete, production-grade **OpenCode stack**: merged settings, **5 plugins** (including oh-my-opencode-slim), **38 skills**, and **10 MCP server presets**. No manual setup, no permissions gymnastics.
 
 [![CI](https://github.com/alisattorov06/ali-kiro/actions/workflows/ci.yml/badge.svg)](https://github.com/alisattorov06/ali-kiro/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Node](https://img.shields.io/badge/Node-%3E%3D18-brightgreen.svg)](https://nodejs.org) [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](docs/COMPATIBILITY.md) [![Downloads](https://img.shields.io/github/downloads/alisattorov06/ali-kiro/total)](https://github.com/alisattorov06/ali-kiro/releases) [![GitHub stars](https://img.shields.io/github/stars/alisattorov06/ali-kiro?style=social)](https://github.com/alisattorov06/ali-kiro)
 
@@ -106,7 +106,8 @@ claude-code  not installed —                 claude --version
 codex        not installed —                 codex --version
 cursor       not installed —                 cursor --version
 aider        not installed —                 aider --version
-gemini       not installed —                 gemini --version
+gemini       installed     0.63.0            gemini --version
+antigravity  installed     1.3.1             agy --version
 
 Use --only <id1,id2> / --skip <id1> to filter, --yes for non-interactive, --dry-run to preview.
 ```
@@ -118,8 +119,8 @@ ali-kiro installer — linux/x64 · node v24.21.0 · DRY RUN (nothing will be ch
 Platform: linux/x64 · package managers: npm, bun, brew, pip, curl, wget
 Assets: config 3/3 · plugins 5 · skills 38 · mcp present
 ✔ Environment OK.
-▸ [2/7] AI selection: menu (TTY) or --only/--skip filters (default: all 6)
-Selected 6 tool(s): opencode, claude-code, codex, cursor, aider, gemini
+▸ [2/7] AI selection: menu (TTY) or --only/--skip filters (default: all 7)
+Selected 7 tool(s): opencode, claude-code, codex, cursor, aider, gemini, antigravity
 ▸ [3/7] OpenCode full stack: config, plugins+deps+smoke, skills, MCP, service
 …
 ▸ [7/7] Final report + dry-run summary + exit code
@@ -133,9 +134,11 @@ Errors: 0   Warnings: 0
 
 Run ali-kiro once and it:
 
-- **Installs and verifies 6 assistants — OpenCode, Claude Code, Codex CLI,
-  Cursor, Aider, and Gemini CLI** — picking the right install method for each
-  OS (npm, brew, pip, cask, AppImage) and confirming each tool actually works
+- **Installs and verifies 7 assistants — OpenCode, Claude Code, Codex CLI,
+  Cursor, Aider, Gemini CLI, and Antigravity CLI** — picking the right install
+  method for each
+  OS (npm, brew, pip, cask, AppImage, official script) and confirming each tool
+  actually works
   afterwards with its `--version` check.
 - **OpenCode deep-install** — merges global settings (`opencode.json`),
   installs **5 plugins** (FlowDeck, harness-memory, oh-my-opencode-slim,
@@ -173,11 +176,11 @@ flowchart TD
 1. **Environment check** — detect OS/arch, available package managers, and
    verify bundled assets integrity.
 2. **AI selection** — interactive menu (TTY) or `--only`/`--skip` filters;
-   defaults to all 6 tools.
+   defaults to all 7 tools.
 3. **OpenCode full stack** — copy config, install 5 plugins with deps +
    import-smoke, copy 38 skills, sync MCP servers, restart the service.
 4. **Other AI assistants** — install + verify each selected tool (OpenCode,
-   Claude Code, Codex CLI, Cursor, Aider, Gemini CLI).
+   Claude Code, Codex CLI, Cursor, Aider, Gemini CLI, Antigravity CLI).
 5. **Verification sweep** — re-check every binary `--version`, plugin smokes,
    and the MCP list.
 6. **Report + state write** — write `~/.ali-kiro/state.json` atomically.
@@ -196,6 +199,7 @@ flowchart TD
 | **Cursor** | `brew install --cask cursor` | [cursor.com](https://www.cursor.com) installer | AppImage from [cursor.com](https://www.cursor.com) | `cursor --version` |
 | **Aider** | `python -m pip install aider-install && aider-install` | `python -m pip install aider-install && aider-install` | `python -m pip install aider-install && aider-install` | `aider --version` |
 | **Gemini CLI** | `npm install -g @google/gemini-cli` | `npm install -g @google/gemini-cli` | `npm install -g @google/gemini-cli` | `gemini --version` |
+| **Antigravity** | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` | `irm https://antigravity.google/cli/install.ps1 \| iex` | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` | `agy --version` |
 
 ali-kiro runs the appropriate command per OS, then verifies each tool with its
 `--version` check. Failures are reported in the final summary — nothing fails
@@ -210,7 +214,7 @@ sits on top of them so you get the whole workspace in one go:
 
 | | ali-kiro | Installing each tool manually |
 |---|---|---|
-| **One command for 6 tools** | ✅ one line on macOS, Windows, or Linux | ❌ six separate installers, six docs pages |
+| **One command for 7 tools** | ✅ one line on macOS, Windows, or Linux | ❌ seven separate installers, seven docs pages |
 | **Built-in verification** | ✅ every tool checked with `--version` after install | ❌ you find broken installs later |
 | **OpenCode stack configured** | ✅ 5 plugins + 38 skills + 10 MCP presets merged for you | ❌ hand-wiring `opencode.json` and plugin dirs |
 | **Idempotent re-runs** | ✅ converges — re-run anytime, no duplicates | ❌ manual maintenance per tool |
@@ -316,7 +320,7 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64. See
 gaps (e.g. Cursor's Linux AppImage doesn't register a CLI on PATH).
 
 **Why another installer when I can run the official installers?**
-One command installs and verifies all six assistants instead of juggling six
+One command installs and verifies all seven assistants instead of juggling seven
 different installers. On top of that you get built-in verification, a state
 ledger at `~/.ali-kiro/state.json`, and a fully configured OpenCode stack
 (5 plugins, 38 skills, 10 MCP presets) — official installers stop at their

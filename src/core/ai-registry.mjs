@@ -164,6 +164,45 @@ export const catalog = [
       windows: { type: 'npm', cmds: [{ type: 'exec', cmd: 'npm', args: ['install', '-g', '@google/gemini-cli'], requires: ['npm'] }] },
     },
   },
+  {
+    name: 'Antigravity',
+    id: 'antigravity',
+    verifyCmd: 'agy',
+    verifyArg: ['--version'],
+    homepage: 'https://antigravity.google/product/antigravity-cli',
+    needsNode: false,
+    needsPython: false,
+    check: '',
+    note: 'Google Antigravity CLI — Terminal TUI (binary `agy`, installed to ~/.local/bin or %LOCALAPPDATA%\\agy\\bin). First `agy` run requires Google sign-in (browser flow). No npm package exists — do not use the npm "antigravity" placeholder.',
+    manual: [
+      'macOS/Linux:  curl -fsSL https://antigravity.google/cli/install.sh | bash',
+      'macOS (brew): brew install --cask antigravity-cli',
+      'Windows:      irm https://antigravity.google/cli/install.ps1 | iex   (alternatives: winget install --id Google.AntigravityCLI -e)',
+    ],
+    perOS: {
+      linux: {
+        type: 'script',
+        cmds: [
+          { type: 'shell', line: 'curl -fsSL https://antigravity.google/cli/install.sh | bash', requires: ['curl'] },
+          { type: 'exec', cmd: 'brew', args: ['install', '--cask', 'antigravity-cli'], requires: ['brew'] },
+        ],
+      },
+      macos: {
+        type: 'script',
+        cmds: [
+          { type: 'shell', line: 'curl -fsSL https://antigravity.google/cli/install.sh | bash', requires: ['curl'] },
+          { type: 'exec', cmd: 'brew', args: ['install', '--cask', 'antigravity-cli'], requires: ['brew'] },
+        ],
+      },
+      windows: {
+        type: 'script',
+        cmds: [
+          { type: 'shell', line: 'irm https://antigravity.google/cli/install.ps1 | iex', requires: ['pwsh'] },
+          { type: 'exec', cmd: 'winget', args: ['install', '--id', 'Google.AntigravityCLI', '-e'], requires: ['winget'] },
+        ],
+      },
+    },
+  },
 ];
 
 export function entryById(id) {

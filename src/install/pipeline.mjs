@@ -19,7 +19,7 @@ export const EXIT = { OK: 0, ENV: 1, INSTALL: 2, VERIFY: 3, USAGE: 4 };
 
 export const STEP_DESCRIPTIONS = [
   'Environment check: OS/arch, package managers, assets integrity',
-  'AI selection: menu (TTY) or --only/--skip filters (default: all 6)',
+  'AI selection: menu (TTY) or --only/--skip filters (default: all 7)',
   'OpenCode full stack: config, plugins+deps+smoke, skills, MCP, service',
   'Other AI assistants: install + verify each selected tool',
   'Verification sweep: re-check every binary version, plugins, MCP list',
@@ -112,8 +112,10 @@ export async function runPipeline(opts = {}) {
   const code = dryRun ? EXIT.OK : finalCode(ctx);
   if (dryRun) {
     logger.info('DRY-RUN COMPLETE — no changes were made. Re-run without --dry-run to apply.');
-  } else {
+  } else if (ctx.selected.includes('opencode')) {
     logger.info('Done. Restart OpenCode (or run `opencode service restart`) to pick up changes.');
+  } else {
+    logger.info('Done. Restart the installed tools to pick up changes.');
   }
   logger.finalReport(summaryFor(ctx));
   return code;
@@ -254,6 +256,7 @@ const PROVIDER_LOADERS = {
   cursor: () => import('../providers/cursor.mjs'),
   aider: () => import('../providers/aider.mjs'),
   gemini: () => import('../providers/gemini.mjs'),
+  antigravity: () => import('../providers/antigravity.mjs'),
 };
 
 async function installOne(ctx, id) {
@@ -295,8 +298,12 @@ async function stepSweep(ctx) {
     }
     logger.info(`sweep: ${id} → ${v ? `v${v}` : 'not found'}`);
   }
-  const existingMcp = (ctx.opts.opencodeBin || 'opencode') && !ctx.dryRun ? await mcpList('opencode') : [];
-  logger.info(`MCP servers currently configured: ${existingMcp.length ? existingMcp.join(', ') : 'none or opencode not available'}`);
+  if (ctx.selected.includes('opencode')) {
+    const existingMcp = await mcpList(ctx.opts.opencodeBin || 'opencode');
+    logger.info(`MCP servers currently configured: ${existingMcp.length ? existingMcp.join(', ') : 'none or opencode not available'}`);
+  } else {
+    logger.info('Skipped OpenCode MCP sweep (opencode not selected)');
+  }
   for (const p of ctx.plugins) {
     if (p.ok) logger.ok(`plugin smoke OK: ${p.name}${p.id ? ` (id=${p.id})` : ''}`);
     else logger.warn(`plugin smoke failed: ${p.name}${p.tsEntry ? ' (TS entry — imported natively by opencode)' : ''}`);

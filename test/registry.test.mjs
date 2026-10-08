@@ -1,14 +1,14 @@
-// ali-kiro — AI assistant catalog (registry). Checks that all 6 known ids are
+// ali-kiro — AI assistant catalog (registry). Checks that all 7 known ids are
 // present in the catalog, that each resolves via entryById, and that every
 // entry has a verify command plus concrete per-OS install commands.
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { catalog, entryById, TOOL_IDS } from '../src/core/ai-registry.mjs';
 
-const IDS = ['opencode', 'claude-code', 'codex', 'cursor', 'aider', 'gemini'];
+const IDS = ['opencode', 'claude-code', 'codex', 'cursor', 'aider', 'gemini', 'antigravity'];
 const OSES = ['linux', 'macos', 'windows'];
 
-test('catalog exposes exactly the 6 known tool ids', () => {
+test('catalog exposes exactly the 7 known tool ids', () => {
   assert.deepStrictEqual(catalog.map((e) => e.id), IDS);
   assert.deepStrictEqual(TOOL_IDS, IDS);
   assert.strictEqual(new Set(IDS).size, IDS.length, 'ids are unique');
@@ -60,4 +60,25 @@ test('commands that need tools declare their requires (npm/curl/pipx/...)', () =
       }
     }
   }
+});
+
+test('antigravity entry targets the Antigravity CLI (agy)', () => {
+  const e = entryById('antigravity');
+  assert.ok(e, 'antigravity entry found');
+  assert.strictEqual(e.name, 'Antigravity');
+  assert.strictEqual(e.verifyCmd, 'agy');
+  assert.deepStrictEqual(e.verifyArg, ['--version']);
+  assert.ok(e.homepage.includes('antigravity.google'), 'homepage points at antigravity.google');
+  assert.strictEqual(e.needsNode, false);
+  assert.strictEqual(e.needsPython, false);
+  for (const os of OSES) {
+    assert.ok(Array.isArray(e.perOS[os].cmds) && e.perOS[os].cmds.length > 0, `${os} cmds non-empty`);
+  }
+  // Official script installers first, package-manager fallbacks second.
+  assert.ok(e.perOS.linux.cmds[0].line.includes('antigravity.google/cli/install.sh'), 'linux uses curl|bash script');
+  assert.ok(e.perOS.macos.cmds[0].line.includes('antigravity.google/cli/install.sh'), 'macos uses curl|bash script');
+  assert.ok(e.perOS.windows.cmds[0].line.includes('antigravity.google/cli/install.ps1'), 'windows uses irm|iex script');
+  assert.strictEqual(e.perOS.windows.cmds[0].requires[0], 'pwsh');
+  assert.deepStrictEqual(e.perOS.windows.cmds[1].args, ['install', '--id', 'Google.AntigravityCLI', '-e']);
+  assert.ok(e.note && /sign-in/.test(e.note), 'note mentions the Google sign-in requirement');
 });
