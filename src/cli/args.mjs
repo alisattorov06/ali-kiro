@@ -45,7 +45,7 @@ USAGE
 GENERAL OPTIONS
   --help, -h            Show this help and exit
   --version, -v         Print version and exit
-  --list                List the 6 known assistants with installed status
+  --list                List the 7 known assistants with installed status
   --steps               Print the 7-step pipeline plan and exit
   --dry-run, -n         Print the plan only — make no changes (exit 0)
   --yes, -y             Non-interactive: pick all tools without the menu
