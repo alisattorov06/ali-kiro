@@ -38,7 +38,7 @@ function spawnOnce(cmd, args, opts, timeoutMs, env) {
       child = spawnImpl(cmd, args, {
         stdio,
         env: { ...(process.env || {}), ...(env || {}) },
-        shell: false,
+        shell: opts.shell ?? false,
         cwd: opts.cwd,
       });
     } catch (e) {
