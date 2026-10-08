@@ -95,9 +95,9 @@ export async function installPlugins(opts = {}) {
       // bun.lock-without-bun falls back to npm; package-lock.json uses npm.
       // --legacy-peer-deps: bundled 3rd-party plugin source; peer resolution is
       // the publisher's concern, and opencode's own plugin loader installs leniently too.
-      const r = await run(npmBin, ['install', '--no-audit', '--no-fund', '--legacy-peer-deps'], { cwd: dir, retries: 3, timeoutMs: 300000, shell: process.platform === 'win32' });
+      const r = await run(npmBin, ['install', '--no-audit', '--no-fund', '--legacy-peer-deps'], { cwd: dir, retries: 3, timeoutMs: 300000, shell: process.platform === 'win32', capture: true });
       record = { name, tool: hasBunLock ? 'npm (bun.lock fallback)' : 'npm', code: r.code, ok: r.code === 0 };
-      if (r.code !== 0) logger.warn(`plugin "${name}": npm install failed (code ${r.code}).`);
+      if (r.code !== 0) { const tail = `${r.out ?? ''}\n${r.err ?? ''}`.trim().split('\n').slice(-6).join('\n'); logger.warn(`plugin "${name}": npm install failed (code ${r.code}).${tail ? `\n${tail}` : ''}`); }
     } else if (hasBunLock || hasPkgLock) {
       logger.warn(`plugin "${name}": lockfile present but no bun/npm found — deps not installed.`);
       record = { name, tool: 'missing-runner', ok: false, code: -1 };

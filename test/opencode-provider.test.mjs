@@ -20,17 +20,6 @@ import {
 } from '../src/providers/opencode.mjs';
 import { createFakeSpawn } from './helpers/fake-spawn.mjs';
 
-// CI-flake hardening: on macOS runners node:test's spec reporter can crash
-// with "Unable to deserialize cloned data..." when an exception escapes
-// between subtests. All subtests in this file assert green locally and on
-// CI; the crash is a runner artifact. Log any escapee to stderr (which the
-// spec reporter passes through untouched) instead of letting the runner die.
-for (const ev of ['uncaughtException', 'unhandledRejection']) {
-  process.on(ev, (e) =>
-    process.stderr.write(`[ali-kiro-test-guard] ${ev}: ${e && e.message ? e.message : String(e)}\n`),
-  );
-}
-
 const FIXTURES = fileURLToPath(new URL('./fixtures', import.meta.url));
 const ASSETS = path.join(FIXTURES, 'opencode-assets');
 
