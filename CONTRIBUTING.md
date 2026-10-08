@@ -72,5 +72,5 @@ bun build --compile ali-kiro.mjs --target=bun-linux-arm64 --outfile ali-kiro-lin
 - `bash install.sh --dry-run` — safe preview (no network writes to your system).
 - `install.ps1` is PowerShell — review it in the PowerShell ISE / VS Code
   extension before pushing; verify braces and `param()` placement.
-- Remember: `npm test` (via CI) must stay green on Node 18, 20, and 22, on
+- Remember: `npm test` (via CI) must stay green on Node 18, 22, and 24, on
   Linux, macOS, and Windows.

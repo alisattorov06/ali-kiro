@@ -10,7 +10,62 @@ Run one line on **macOS, Windows, or Linux** — `curl -fsSL … | bash` or `irm
 
 ---
 
-## Install
+## What is ali-kiro?
+
+ali-kiro is a free, open-source, **one-command, cross-platform installer and manager for AI coding assistants** on macOS, Windows, and Linux. It installs, verifies, and configures **7 assistants — OpenCode, Claude Code, Codex CLI, Cursor, Aider, Gemini CLI, and Antigravity CLI** — and then layers a complete, production-grade **OpenCode stack** (5 plugins, 38 skills, 10 MCP server presets) on top. It is a small, zero-dependency Node.js CLI (Node ≥ 18) that also ships as self-contained prebuilt binaries — no runtime dependencies, no lock-in.
+
+### Why ali-kiro?
+
+**Setting up AI coding on a new machine today is a chore: 6+ different installers, a separate docs page for each tool, and no way to know whether anything actually works.**
+
+ali-kiro turns that into **one command**: it installs all 7 assistants consistently across macOS, Windows, and Linux, verifies every one with its own `--version` check, and configures the OpenCode stack (plugins, skills, MCP servers) on top. Re-runs are **idempotent** — already-installed tools are skipped, only missing pieces are touched. A **state ledger** at `~/.ali-kiro/state.json` tells you exactly what is installed and working. Zero runtime dependencies, official installers under the hood, MIT licensed — no lock-in.
+
+![ali-kiro — live interface](docs/ali-kiro-interface.png)
+
+---
+
+## Features
+
+Run ali-kiro once and it:
+
+- **Installs and verifies 7 assistants — OpenCode, Claude Code, Codex CLI,
+  Cursor, Aider, Gemini CLI, and Antigravity CLI** — picking the right install
+  method for each OS (npm, brew, pip, cask, AppImage, official script) and
+  confirming each tool actually works afterwards with its `--version` check.
+- **OpenCode deep-install** — merges global settings (`opencode.json`),
+  installs **5 plugins** (FlowDeck, harness-memory, oh-my-opencode-slim,
+  opencode-dynamic-context-pruning, opencode-snip), **38 skills** across
+  proven groups, and syncs **10 MCP server presets** (6 auto-configured, 4
+  flagged for a quick manual touch such as adding your GitHub token).
+- **Keeps a state ledger** at `~/.ali-kiro/state.json` — the single source of
+  truth for what is installed, which version, and whether it verified.
+- **Is fully idempotent** — re-run it any time; already-installed tools are
+  skipped, only missing or outdated pieces are touched.
+- **Supports dry-run** — `ali-kiro --dry-run` shows the exact plan without
+  changing anything, so you can preview before you commit.
+- **Verifies silently** — every tool is re-checked after install and again in
+  the final sweep; failures are reported in the summary, never hidden.
+
+Under the hood, ali-kiro ships as a small zero-dependency Node.js CLI
+(`ali-kiro.mjs`) and as self-contained compiled binaries built with Bun
+(no Node.js required).
+
+### ali-kiro vs manual installs
+
+The official installers are excellent at installing their own tool. ali-kiro
+sits on top of them so you get the whole workspace in one go:
+
+| | ali-kiro | Installing each tool manually |
+|---|---|---|
+| **One command for 7 tools** | ✅ one line on macOS, Windows, or Linux | ❌ seven separate installers, seven docs pages |
+| **Built-in verification** | ✅ every tool checked with `--version` after install | ❌ you find broken installs later |
+| **OpenCode stack configured** | ✅ 5 plugins + 38 skills + 10 MCP presets merged for you | ❌ hand-wiring `opencode.json` and plugin dirs |
+| **Idempotent re-runs** | ✅ converges — re-run anytime, no duplicates | ❌ manual maintenance per tool |
+| **Single state ledger** | ✅ `~/.ali-kiro/state.json` knows what/version/verified | ❌ nothing tracks your setup |
+
+---
+
+## Installation
 
 | Method | Command |
 |--------|---------|
@@ -95,7 +150,10 @@ bun build --compile ali-kiro.mjs --outfile ali-kiro   # optional: build the bina
 
 ---
 
-## Quick demo
+## Quick start
+
+See the whole catalog with installed status, then install everything — or
+preview the plan first:
 
 ```console
 $ node ali-kiro.mjs --list
@@ -128,64 +186,19 @@ DRY-RUN COMPLETE — no changes were made. Re-run without --dry-run to apply.
 Errors: 0   Warnings: 0
 ```
 
----
+### Common commands
 
-## What it does
-
-Run ali-kiro once and it:
-
-- **Installs and verifies 7 assistants — OpenCode, Claude Code, Codex CLI,
-  Cursor, Aider, Gemini CLI, and Antigravity CLI** — picking the right install
-  method for each
-  OS (npm, brew, pip, cask, AppImage, official script) and confirming each tool
-  actually works
-  afterwards with its `--version` check.
-- **OpenCode deep-install** — merges global settings (`opencode.json`),
-  installs **5 plugins** (FlowDeck, harness-memory, oh-my-opencode-slim,
-  opencode-dynamic-context-pruning, opencode-snip), **38 skills** across
-  proven groups, and syncs **10 MCP server presets** (6 auto-configured, 4
-  flagged for a quick manual touch such as adding your GitHub token).
-- **Keeps a state ledger** at `~/.ali-kiro/state.json` — the single source of
-  truth for what is installed, which version, and whether it verified.
-- **Is fully idempotent** — re-run it any time; already-installed tools are
-  skipped, only missing or outdated pieces are touched.
-- **Supports dry-run** — `ali-kiro --dry-run` shows the exact plan without
-  changing anything, so you can preview before you commit.
-
-Under the hood, ali-kiro ships as a small zero-dependency Node.js CLI
-(`ali-kiro.mjs`) and as self-contained compiled binaries built with Bun
-(no Node.js required).
-
----
-
-## How it works
-
-```mermaid
-flowchart TD
-    A[Start: one-command install] --> B[Detect OS / architecture]
-    B --> C[Download release binary + SHA-256SUMS]
-    C --> D[Verify checksum]
-    D --> E[Install to ~/.ali-kiro/bin]
-    E --> F[Run CLI]
-    F --> G[Install tools from the catalog]
-    F --> H[Configure OpenCode stack: plugins, skills, MCP]
-    G --> I[Write state.json]
-    H --> I
+```bash
+ali-kiro --list                          # show what's installed and what's missing
+ali-kiro                                 # interactive menu — pick tools to install
+ali-kiro --yes                           # install everything, no prompts
+ali-kiro --dry-run                       # preview the plan; changes nothing
+ali-kiro --only opencode                 # install just one tool (+ its OpenCode stack)
+ali-kiro --target ~/ali-kiro-test        # install into an isolated dir (testing)
 ```
 
-1. **Environment check** — detect OS/arch, available package managers, and
-   verify bundled assets integrity.
-2. **AI selection** — interactive menu (TTY) or `--only`/`--skip` filters;
-   defaults to all 7 tools.
-3. **OpenCode full stack** — copy config, install 5 plugins with deps +
-   import-smoke, copy 38 skills, sync MCP servers, restart the service.
-4. **Other AI assistants** — install + verify each selected tool (OpenCode,
-   Claude Code, Codex CLI, Cursor, Aider, Gemini CLI, Antigravity CLI).
-5. **Verification sweep** — re-check every binary `--version`, plugin smokes,
-   and the MCP list.
-6. **Report + state write** — write `~/.ali-kiro/state.json` atomically.
-7. **Final report** — per-tool status summary and exit code (`--dry-run`
-   prints the plan without changing anything).
+Afterwards, **restart OpenCode** once so it picks up the new plugins, skills,
+and MCP servers.
 
 ---
 
@@ -207,38 +220,7 @@ silently.
 
 ---
 
-## Why ali-kiro?
-
-The official installers are excellent at installing their own tool. ali-kiro
-sits on top of them so you get the whole workspace in one go:
-
-| | ali-kiro | Installing each tool manually |
-|---|---|---|
-| **One command for 7 tools** | ✅ one line on macOS, Windows, or Linux | ❌ seven separate installers, seven docs pages |
-| **Built-in verification** | ✅ every tool checked with `--version` after install | ❌ you find broken installs later |
-| **OpenCode stack configured** | ✅ 5 plugins + 38 skills + 10 MCP presets merged for you | ❌ hand-wiring `opencode.json` and plugin dirs |
-| **Idempotent re-runs** | ✅ converges — re-run anytime, no duplicates | ❌ manual maintenance per tool |
-| **Single state ledger** | ✅ `~/.ali-kiro/state.json` knows what/version/verified | ❌ nothing tracks your setup |
-
----
-
-## Quickstart
-
-```bash
-ali-kiro --list                          # show what's installed and what's missing
-ali-kiro                                 # interactive menu — pick tools to install
-ali-kiro --yes                           # install everything, no prompts
-ali-kiro --dry-run                       # preview the plan; changes nothing
-ali-kiro --only opencode                 # install just one tool (+ its OpenCode stack)
-ali-kiro --target ~/ali-kiro-test        # install into an isolated dir (testing)
-```
-
-Afterwards, **restart OpenCode** once so it picks up the new plugins, skills,
-and MCP servers.
-
----
-
-## What gets installed for OpenCode
+## OpenCode stack
 
 | Item | Detail |
 |------|--------|
@@ -290,41 +272,100 @@ installs, so re-runs converge instead of duplicating work.
 
 ---
 
-## FAQ
+## Commands
 
-**Is it safe to re-run ali-kiro?**
-Yes. Every step is idempotent: already-installed tools are detected and
-skipped, and the state ledger at `~/.ali-kiro/state.json` keeps re-runs fast
-and deterministic.
+`node ali-kiro.mjs --help` (or the `ali-kiro` binary) prints the full usage;
+the essentials:
 
-**What if I don't have Node.js?**
-The prebuilt binary needs no Node.js at all. If only the source path is
-available (e.g. right after a release that has no binary yet), the installer
-auto-installs Node.js LTS (`brew install node` / NodeSource / `winget install
-OpenJS.NodeJS.LTS`, depending on your OS).
+| Command | What it does |
+|---------|--------------|
+| `--list` | List all 7 cataloged assistants with installed status, version, and verify command |
+| `--yes`, `-y` | Non-interactive: select every available tool without the menu |
+| `--dry-run`, `-n` | Print the plan only — make no changes (exit 0) |
+| `--only <id1,id2>` | Install only the listed tools (e.g. `--only opencode`) |
+| `--skip <id1,id2>` | Install everything except the listed tools (e.g. `--skip cursor`) |
+| `--target <dir>` | Install OpenCode config/plugins/skills/MCP into `<dir>` instead of the default config dir (testing/portable installs) |
+| `--demo` | Run a scripted fake session for terminal recordings (no real installs) |
+| `--version`, `-v` | Print the version and exit |
+| `--help`, `-h` | Show usage, all options, and exit codes |
 
-**How do the manual MCP servers work?**
-The `github` preset needs an `Authorization: token <GITHUB_TOKEN>` header —
-ali-kiro never hardcodes credentials. `tokenOptimizer` uses a native
-`better-sqlite3` binding; if it fails to start on your system, rebuild it:
-`cd ~/.npm/_npx/<dir> && npm rebuild better-sqlite3`. See
-[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+Also available: `--quiet`/`-q` (suppress non-error output), `--strict` (abort
+on the first install/verify failure), `--steps` (print the 7-step pipeline
+plan), and per-scope `--no-config` / `--no-plugins` / `--no-skills` / `--no-mcp`
+/ `--no-npm` flags to skip parts of the OpenCode stack. Exit codes: `0` ok ·
+`1` environment problem · `2` install failed · `3` verify failed · `4` usage
+error.
 
-**Do I need to restart OpenCode after installing?**
-Yes — restart OpenCode (quit and relaunch) so it picks up the new plugins,
-38 skills, and MCP servers.
+---
 
-**Which platforms are supported?**
-Linux x64/arm64, macOS x64/arm64, and Windows x64. See
-[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for the full matrix and known
-gaps (e.g. Cursor's Linux AppImage doesn't register a CLI on PATH).
+## Configuration
 
-**Why another installer when I can run the official installers?**
-One command installs and verifies all seven assistants instead of juggling seven
-different installers. On top of that you get built-in verification, a state
-ledger at `~/.ali-kiro/state.json`, and a fully configured OpenCode stack
-(5 plugins, 38 skills, 10 MCP presets) — official installers stop at their
-own binary.
+- **`~/.ali-kiro/state.json` — the state ledger.** Written atomically after
+  each run; records the OS/arch, every tool id with its `{installed, version,
+  action}` (versions found by running each tool's `verifyCmd`), the plugins
+  and their smoke-test results, the skills count, the MCP servers touched, and
+  any errors/warnings. This is what makes re-runs converge.
+- **`ALI_KIRO_ASSETS` (env var)** — overrides where the bundled assets
+  (config, plugins, skills, MCP presets) are loaded from.
+- **`--target <dir>`** — redirects the OpenCode config/plugins/skills/MCP
+  install into `<dir>` instead of the default config dir (portable/testing).
+  Assets are resolved in this order: explicit `--assets-root` option →
+  `ALI_KIRO_ASSETS` → `assets/` beside the running binary → `./assets` in the
+  current directory → the bundled fallback (`src/assets` in source mode).
+- **Each tool's config lives in its own standard location.** ali-kiro writes
+  configuration where the tool itself looks for it — for example the OpenCode
+  config dir resolves as `%APPDATA%\opencode` on Windows (falling back to
+  `USERPROFILE\.config\opencode`), and `$XDG_CONFIG_HOME/opencode` on
+  macOS/Linux (falling back to `~/.config/opencode`).
+- **Log redaction.** Anything that looks like a credential argument
+  (`--key`, `--token`, `--secret`, `--password`, `--auth`, `--bearer`, …) is
+  masked as `***REDACTED***` in command labels and error output — secrets are
+  never echoed.
+
+---
+
+## Documentation
+
+| Doc | What it covers |
+|-----|----------------|
+| [ARCHITECTURE](docs/ARCHITECTURE.md) | Module map, the 7-step pipeline, state ledger, asset layout, exit codes, retry policy |
+| [COMPATIBILITY](docs/COMPATIBILITY.md) | Platform matrix, runtimes, per-tool install methods, tested versions, known gaps |
+| [TROUBLESHOOTING](docs/TROUBLESHOOTING.md) | Common install/run problems, fixes, and an FAQ |
+| [SECURITY](SECURITY.md) | Security model: no hardcoded secrets, log redaction, supply chain, reporting |
+| [CONTRIBUTING](CONTRIBUTING.md) | Development setup, code style, and the pull-request flow |
+
+---
+
+## Security
+
+- **No hardcoded secrets** — ali-kiro ships zero credentials. API keys and
+  tokens are read only from your environment (e.g. `GEMINI_API_KEY`,
+  `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, `EXA_API_KEY`) and passed through to
+  the tools that need them.
+- **Log redaction** — command labels and error output mask anything that looks
+  like a credential argument (`--key`, `--token`, `--password`, …) as
+  `***REDACTED***`.
+- **Supply chain** — the one-liners download official per-tool installers, and
+  ali-kiro's own downloaded binary is verified against `SHA-256SUMS` when the
+  release publishes one.
+- **State ledger** — `~/.ali-kiro/state.json` stores tool ids, versions, and
+  actions only — never credentials.
+- **Per-tool auth** — each assistant handles its own first-run sign-in (e.g.
+  `agy` opens a Google sign-in browser flow on first run; the other tools use
+  their own login or API-key modes). ali-kiro never stores those tokens.
+
+Full details in [SECURITY.md](SECURITY.md).
+
+---
+
+## Contributing
+
+Contributions of any size are welcome — bug reports, docs, tests, new tool
+providers, and installer improvements. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for the development setup, code style (ESM, zero runtime dependencies), and
+the pull-request flow. The test suite is `npm test` (`node --test`, currently
+124 tests) and must stay green on Node 18/22/24 across Linux, macOS, and
+Windows.
 
 ---
 
@@ -334,7 +375,7 @@ own binary.
 
 ---
 
-## CREDITS
+### CREDITS
 
 ali-kiro builds on and bundles the work of many excellent open-source projects.
 Every upstream source is credited here; bundled code retains its original

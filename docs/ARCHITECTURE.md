@@ -2,11 +2,43 @@
 
 This document describes the high-level architecture of **ali-kiro**: a
 one-command, cross-platform installer and manager for AI coding assistants
-(OpenCode, Claude Code, OpenAI Codex, Cursor, Aider, Gemini CLI), with a full
-OpenCode stack (configuration, plugins, skills, and MCP server presets) bundled.
+(OpenCode, Claude Code, OpenAI Codex, Cursor, Aider, Gemini CLI, Antigravity
+CLI), with a full OpenCode stack (configuration, plugins, skills, and MCP
+server presets) bundled.
 
 Everything below describes the design as implemented. If small details drift
 from what you see in the code, treat the code as the source of truth.
+
+## Pipeline overview
+
+The user-facing flow, straight from the README:
+
+```mermaid
+flowchart TD
+    A[Start: one-command install] --> B[Detect OS / architecture]
+    B --> C[Download release binary + SHA-256SUMS]
+    C --> D[Verify checksum]
+    D --> E[Install to ~/.ali-kiro/bin]
+    E --> F[Run CLI]
+    F --> G[Install tools from the catalog]
+    F --> H[Configure OpenCode stack: plugins, skills, MCP]
+    G --> I[Write state.json]
+    H --> I
+```
+
+1. **Environment check** — detect OS/arch, available package managers, and
+   verify bundled assets integrity.
+2. **AI selection** — interactive menu (TTY) or `--only`/`--skip` filters;
+   defaults to all 7 tools.
+3. **OpenCode full stack** — copy config, install 5 plugins with deps +
+   import-smoke, copy 38 skills, sync MCP servers, restart the service.
+4. **Other AI assistants** — install + verify each selected tool (OpenCode,
+   Claude Code, Codex CLI, Cursor, Aider, Gemini CLI, Antigravity CLI).
+5. **Verification sweep** — re-check every binary `--version`, plugin smokes,
+   and the MCP list.
+6. **Report + state write** — write `~/.ali-kiro/state.json` atomically.
+7. **Final report** — per-tool status summary and exit code (`--dry-run`
+   prints the plan without changing anything).
 
 ## Module map
 
@@ -17,8 +49,8 @@ src/
   cli/        Argument parsing, the interactive tool selector, and report
               rendering (terminal menu + final summary).
   install/    Per-tool installers (OpenCode, Claude Code, Codex, Cursor,
-              Aider, Gemini CLI), the Node.js bootstrap helper, and
-              platform helpers (POSIX + Windows).
+              Aider, Gemini CLI, Antigravity CLI), the Node.js bootstrap
+              helper, and platform helpers (POSIX + Windows).
   providers/  Knowledge about each AI tool: how to detect an existing
               installation, the install command for each OS, and the
               verification command.
@@ -30,27 +62,6 @@ The binaries (`ali-kiro.mjs` → `ali-kiro` via `bun build --compile`) are just
 the CLI entry point over the same modules — there is no separate binary logic
 to maintain.
 
-## The 7-step pipeline
-
-Every invocation of `ali-kiro` runs the same pipeline:
-
-1. **Parse arguments** — `--list`, `--yes`, `--dry-run`, `--only <tool>`,
-   `--target <dir>`, plus flags passed through to the underlying tools.
-2. **Load the state ledger** — reads `~/.ali-kiro/state.json` (or the
-   `--target` override) so the run starts from what is actually installed.
-3. **Detect the environment** — OS + architecture, Node.js version, which of
-   the 6 AI tools are already present, and their versions.
-4. **Compute the plan** — build the desired-state manifest (tools + OpenCode
-   stack) and diff it against the ledger and the live environment.
-5. **Gate on dry-run** — with `--dry-run`, render the plan and exit
-   (exit code 0) without mutating anything.
-6. **Execute** — install each missing/outdated piece. Every step is idempotent:
-   already-satisfied steps are skipped, failed steps are retried (see
-   "Error and retry policy") and the run continues with the next tool.
-7. **Verify and persist** — re-check each tool's verification command, write
-   the updated state ledger, print the final report, and exit with an
-   appropriate code.
-
 ## State ledger
 
 ```
@@ -59,9 +70,9 @@ Every invocation of `ali-kiro` runs the same pipeline:
 
 - One JSON record per managed item (tool, plugin, skill set, MCP server), with
   `status`, `version`, `installMethod`, `installedAt`, and `verified`.
-- `--target <dir>` redirects the ledger (and all writes) to a test directory,
-  which is how dry runs and smoke tests are validated without touching the
-  user's real configuration.
+- The ledger lives at `~/.ali-kiro/state.json`. `--target <dir>` redirects the
+  OpenCode config install (config/plugins/skills/MCP) for portable/testing
+  runs — it does not move the ledger.
 - The ledger is what makes ali-kiro **idempotent**: re-running converges to
   the same state instead of duplicating installs.
 
@@ -87,10 +98,10 @@ src/assets/
 | Code | Meaning |
 |------|---------|
 | `0` | Everything installed/verified successfully (or a successful dry run) |
-| `1` | Generic error (network failure, Node.js bootstrap failed, unexpected exit) |
-| `2` | CLI usage error (unknown flag, invalid `--only` value, bad `--target`) |
-| `3` | Partial success — some tools installed, others failed |
-| `4` | Verification failed — installs completed but post-install checks did not pass |
+| `1` | Environment problem — OS/arch or bundled-assets check failed |
+| `2` | Install failed — a tool install or the OpenCode stack did not complete |
+| `3` | Verification failed — installs completed but post-install checks did not pass |
+| `4` | Usage error — unknown flag, invalid `--only`/`--skip` id, missing `--target` value |
 
 ## Error and retry policy
 

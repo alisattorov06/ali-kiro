@@ -19,7 +19,7 @@ No 32-bit (i386/armv7) builds are published.
 
 | Runtime | Required | Notes |
 |---------|----------|-------|
-| Node.js | **≥ 18** | 20/22 LTS recommended. Only needed for the *from-source* method and for MCP servers that run `npx`. |
+| Node.js | **≥ 18** | CI tests on 18 / 22 / 24; current LTS recommended. Only needed for the *from-source* method and for MCP servers that run `npx`. |
 | Bun | ≥ 1.1 | Only needed when *building* the binary from source (`bun build --compile`). Not needed to run ali-kiro. |
 | git / curl / wget | optional | The installers use these when available and fall back gracefully when they are not. |
 
@@ -47,6 +47,17 @@ run.
 | Cursor | GUI installer from cursor.com (`brew install --cask cursor` on macOS) | `cursor --version` |
 | Aider | `python -m pip install aider-install && aider-install` | `aider --version` |
 | Gemini CLI | `npm install -g @google/gemini-cli` | `gemini --version` |
+
+## Tested versions
+
+| Tool | Confirmed version (Oct 2026) |
+|------|------------------------------|
+| agy (Antigravity CLI) | 1.3.x |
+| gemini (Gemini CLI) | 0.63.x |
+| opencode | 2.0.24 |
+
+The CI matrix runs the full test suite on **Node 18 / 22 / 24** across
+**Linux, macOS, and Windows**; Node ≥ 18 is the declared minimum.
 
 ## Bundled OpenCode stack compatibility
 

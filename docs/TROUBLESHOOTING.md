@@ -117,3 +117,25 @@ powershell -ExecutionPolicy Bypass -File install.ps1
   `bun-darwin-arm64`, `bun-windows-x64` — Windows builds get a `.exe` suffix
   automatically).
 - Tests: `npm test` (runs `node --test test/`).
+
+## FAQ
+
+**Is it safe to re-run ali-kiro?**
+Yes. Every step is idempotent: already-installed tools are detected and
+skipped, and the state ledger at `~/.ali-kiro/state.json` keeps re-runs fast
+and deterministic.
+
+**Why another installer when I can run the official installers?**
+One command installs and verifies all seven assistants instead of juggling
+seven different installers. On top of that you get built-in verification, a
+state ledger at `~/.ali-kiro/state.json`, and a fully configured OpenCode
+stack (5 plugins, 38 skills, 10 MCP presets) — official installers stop at
+their own binary.
+
+**Which platforms are supported?**
+Linux x64/arm64, macOS x64/arm64, and Windows x64. See
+[COMPATIBILITY.md](COMPATIBILITY.md) for the full matrix and known gaps (e.g.
+Cursor's Linux AppImage doesn't register a CLI on PATH).
+
+Node.js requirements, the manual MCP servers, and restarting OpenCode after an
+install are covered in the sections above.
